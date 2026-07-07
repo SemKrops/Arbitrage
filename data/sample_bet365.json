@@ -1,0 +1,32 @@
+[
+  {
+    "competition": "premier_league",
+    "event": "Liverpool vs Arsenal",
+    "kickoff": "2026-07-11 17:30",
+    "player": "Mohamed Salah",
+    "market": "player_shots",
+    "line": 2.5,
+    "over": 2.10,
+    "under": 1.72
+  },
+  {
+    "competition": "la_liga",
+    "event": "Real Madrid vs Barcelona",
+    "kickoff": "2026-07-12 21:00",
+    "player": "Vinicius Junior",
+    "market": "player_shots_on_target",
+    "line": 1.5,
+    "over": 1.70,
+    "under": 2.30
+  },
+  {
+    "competition": "world_cup",
+    "event": "France vs Netherlands",
+    "kickoff": "2026-07-14 20:00",
+    "player": "Kylian Mbappe",
+    "market": "player_shots",
+    "line": 3.5,
+    "over": 2.20,
+    "under": 1.68
+  }
+]
