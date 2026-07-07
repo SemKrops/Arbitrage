@@ -46,7 +46,7 @@ All settings live in `.env` (see `.env.example`):
 | `TOTAL_STAKE` | `100` | € split across the two legs |
 | `MIN_PROFIT_PCT` | `0.5` | Ignore arbs below this guaranteed % |
 | `POLL_INTERVAL_SECONDS` | `300` | Delay between scans |
-| `BET365_PROVIDER` | `mock` | `mock` or `file` |
+| `BET365_PROVIDER` | `mock` | `mock`, `file` or `selenium` |
 | `UNIBET_PROVIDER` | `mock` | `mock`, `kambi` or `file` |
 | `BET365_DATA_FILE` / `UNIBET_DATA_FILE` | — | JSON path or https URL for the `file` provider |
 
@@ -59,16 +59,31 @@ base URL, locale and per-competition paths are overridable via `KAMBI_*`
 variables (see `.env.example`). If the API shape changes, the provider logs
 a warning and returns what it can.
 
-**Bet365 has no public API** and uses aggressive anti-bot protection, so
-this project deliberately does not ship a Bet365 scraper — one would be
-fragile, quickly IP-banned, and against Bet365's terms of service. Instead,
-set `BET365_PROVIDER=file` and point `BET365_DATA_FILE` at a JSON file or
-URL in the simple format shown in `data/sample_bet365.json`, fed by whatever
-source you are licensed to use (a commercial odds feed such as OddsJam /
-OpticOdds / The Odds API, or your own collector). Any source that can emit
-that JSON works without touching the code. Alternatively, implement a new
-provider: subclass `arb_tool.providers.base.OddsProvider` and register it in
-`arb_tool/providers/__init__.py`.
+**Bet365 has no public API.** Two integration paths are included:
+
+1. **Selenium scraper** (`BET365_PROVIDER=selenium`) — drives a real
+   Chromium, walks the competition pages and parses the Player Shots /
+   Player Shots on Target market groups. Bet365's bot detection is
+   aggressive, so for a fighting chance run it **from a residential IP**
+   (never a datacenter/VPN), preferably **non-headless**
+   (`BET365_HEADLESS=0`), and `pip install undetected-chromedriver` —
+   it is picked up automatically when installed. Bet365 renames its CSS
+   classes periodically; all selectors live in one `SELECTORS` dict at the
+   top of `arb_tool/providers/bet365_selenium.py`. Scraping violates
+   Bet365's terms of service — use at your own risk, for personal use.
+2. **File/feed** (`BET365_PROVIDER=file`) — point `BET365_DATA_FILE` at a
+   JSON file or URL in the format shown in `data/sample_bet365.json`, fed
+   by a commercial odds feed (OddsJam / OpticOdds / The Odds API) or your
+   own collector. The reliable option.
+
+Custom sources: subclass `arb_tool.providers.base.OddsProvider` and
+register it in `arb_tool/providers/__init__.py`.
+
+> **Note:** live odds cannot be fetched from Claude's cloud sandbox — its
+> network policy blocks both bet365.nl and the Kambi CDN. Run the tool on
+> your own machine for real data; the scraper's DOM parsing is covered by
+> tests against a static replica of Bet365's markup
+> (`tests/fixtures/bet365_match.html`).
 
 ## Example alert
 

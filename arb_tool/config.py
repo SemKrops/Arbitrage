@@ -36,7 +36,7 @@ class Config:
     min_profit_pct: float = 0.5
     poll_interval_seconds: int = 300
     competitions: tuple[Competition, ...] = field(default=DEFAULT_COMPETITIONS)
-    bet365_provider: str = "mock"  # mock | file
+    bet365_provider: str = "mock"  # mock | file | selenium
     unibet_provider: str = "mock"  # mock | kambi | file
     bet365_data_file: str = ""
     unibet_data_file: str = ""
