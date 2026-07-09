@@ -5,6 +5,18 @@ via Selenium: opens the competition page, walks the listed matches, opens
 each match page and reads the "Player Shots" / "Player Shots on Target"
 market groups.
 
+How bet365 hides its DOM
+------------------------
+bet365 renders the entire sports UI inside *closed* shadow DOM roots: the
+top document contains little more than the header and betslip, while the
+content is invisible to ``page_source``, plain CSS selection and
+``element.shadowRoot``. Two counters are used here:
+
+* a script injected before any page JS runs rewrites
+  ``Element.attachShadow`` so every shadow root is created *open*;
+* all element lookups go through a JavaScript deep query that descends
+  into (now open) shadow roots, instead of ``find_elements``.
+
 Realistic expectations
 ----------------------
 Bet365 employs aggressive bot detection (fingerprinting, IP reputation,
@@ -18,9 +30,8 @@ geo-blocking). This scraper works best:
   instead of plain Selenium.
 
 Bet365 also changes its CSS class names from time to time; the selectors
-live in the SELECTORS dict below so they can be fixed in one place. When a
-page fails to parse, the provider logs a warning and (with -v) dumps the
-page title to help diagnose whether you were blocked or the layout changed.
+live in the SELECTORS dict below so they can be fixed in one place. Use
+``python -m arb_tool --dump-bet365`` to see what the current DOM offers.
 
 Environment variables:
 
@@ -84,6 +95,82 @@ COMPETITION_LINKS = {
     Competition.WORLD_CUP: ("world cup", "wk", "wereldkampioenschap"),
 }
 
+# Injected before any page script runs: bet365 creates its shadow roots
+# closed, which hides them from automation; force them open.
+_FORCE_OPEN_SHADOW_JS = """
+(function () {
+  const original = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function (init) {
+    const opened = Object.assign({}, init || {}, { mode: 'open' });
+    return original.call(this, opened);
+  };
+})();
+"""
+
+# Deep querySelectorAll that descends into open shadow roots. arguments[0]
+# is the CSS selector, arguments[1] an optional root element/document.
+_DEEP_QUERY_JS = """
+const selector = arguments[0];
+const start = arguments[1] || document;
+const out = [];
+function collect(root) {
+  if (!root.querySelectorAll) return;
+  for (const el of root.querySelectorAll(selector)) out.push(el);
+  for (const el of root.querySelectorAll('*')) {
+    if (el.shadowRoot) collect(el.shadowRoot);
+  }
+}
+collect(start);
+if (start.shadowRoot) collect(start.shadowRoot);
+return out;
+"""
+
+# One-shot page statistics for --dump-bet365: selector hit counts, class
+# token frequencies and clickable texts, all shadow-DOM aware.
+_DUMP_STATS_JS = """
+const selectors = arguments[0];
+const classRegex = /Coupon|Market|Particip|Fixture|Label|Link|Button|Header|Odds|Classification|Splash|Menu|Nav|Team|Event/;
+const roots = [];
+function collectRoots(root) {
+  if (!root.querySelectorAll) return;
+  roots.push(root);
+  for (const el of root.querySelectorAll('*')) {
+    if (el.shadowRoot) collectRoots(el.shadowRoot);
+  }
+}
+collectRoots(document);
+
+const hits = {};
+for (const [name, css] of Object.entries(selectors)) {
+  let n = 0;
+  for (const root of roots) n += root.querySelectorAll(css).length;
+  hits[name] = n;
+}
+
+const classes = {};
+const texts = [];
+const seen = new Set();
+for (const root of roots) {
+  for (const el of root.querySelectorAll('*')) {
+    if (el.classList) {
+      for (const token of el.classList) {
+        if (classRegex.test(token)) classes[token] = (classes[token] || 0) + 1;
+      }
+    }
+  }
+  for (const el of root.querySelectorAll(
+    "a, [class*='Link'], [class*='Button'], [class*='Label']"
+  )) {
+    const text = (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 60);
+    if (text && !seen.has(text) && seen.size < 40) {
+      seen.add(text);
+      texts.push(text);
+    }
+  }
+}
+return { shadowRoots: roots.length - 1, hits: hits, classes: classes, texts: texts };
+"""
+
 
 def fractional_to_decimal(odds_text: str) -> float | None:
     """Parse bet365 odds shown as decimal ("2.10") or fractional ("11/10")."""
@@ -137,9 +224,11 @@ class SeleniumBet365Provider(OddsProvider):
                 # A ChromeOptions object cannot be reused between attempts.
                 options = uc.ChromeOptions()
                 self._apply_common_options(options)
-                return uc.Chrome(
+                driver = uc.Chrome(
                     options=options, headless=self.headless, version_main=version
                 )
+                self._install_page_scripts(driver)
+                return driver
 
             try:
                 return launch(version_main)
@@ -179,7 +268,13 @@ class SeleniumBet365Provider(OddsProvider):
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
         )
+        self._install_page_scripts(driver)
         return driver
+
+    def _install_page_scripts(self, driver) -> None:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument", {"source": _FORCE_OPEN_SHADOW_JS}
+        )
 
     def _apply_common_options(self, options) -> None:
         options.add_argument("--window-size=1600,1000")
@@ -193,6 +288,20 @@ class SeleniumBet365Provider(OddsProvider):
             options.add_argument(f"--proxy-server={proxy}")
 
     # ------------------------------------------------------------------ #
+    # Shadow-DOM aware element access
+    # ------------------------------------------------------------------ #
+
+    def _query(self, driver, selector: str, root=None) -> list:
+        """querySelectorAll that also searches inside open shadow roots."""
+        return driver.execute_script(_DEEP_QUERY_JS, selector, root)
+
+    def _text(self, driver, element) -> str:
+        return (driver.execute_script("return arguments[0].innerText", element) or "").strip()
+
+    def _click(self, driver, element) -> None:
+        driver.execute_script("arguments[0].click()", element)
+
+    # ------------------------------------------------------------------ #
     # Navigation
     # ------------------------------------------------------------------ #
 
@@ -204,8 +313,6 @@ class SeleniumBet365Provider(OddsProvider):
             driver.quit()
 
     def _scrape(self, driver, competitions: tuple[Competition, ...]) -> list[PropOdds]:
-        from selenium.webdriver.common.by import By
-
         props: list[PropOdds] = []
         for competition in competitions:
             try:
@@ -217,7 +324,7 @@ class SeleniumBet365Provider(OddsProvider):
                 )
                 for url in event_urls[: self.max_events]:
                     driver.get(url)
-                    self._wait_for(driver, By.CSS_SELECTOR, SELECTORS["market_group"])
+                    self._wait_for(driver, SELECTORS["market_group"])
                     props.extend(self._parse_match_page(driver, competition))
             except Exception as exc:
                 log.warning(
@@ -230,49 +337,45 @@ class SeleniumBet365Provider(OddsProvider):
 
     def _open_competition(self, driver, competition: Competition) -> bool:
         """Land on the competition's fixtures page; True on success."""
-        from selenium.webdriver.common.by import By
-
         deep_link = self.competition_urls[competition]
         if deep_link:
             driver.get(deep_link)
-            return self._wait_for(driver, By.CSS_SELECTOR, SELECTORS["event_row"])
+            return self._wait_for(driver, SELECTORS["event_row"])
 
         driver.get(f"{self.base_url}/#/AS/B1/")  # football section
         self._dismiss_cookies(driver)
-        if not self._wait_for(driver, By.CSS_SELECTOR, SELECTORS["competition_link"]):
+        if not self._wait_for(driver, SELECTORS["competition_link"]):
             log.warning(
-                "Bet365: football section did not load (title %r) — likely "
-                "blocked; try BET365_HEADLESS=0 and a residential IP, or set "
-                "BET365_URL_%s to a direct competition link.",
+                "Bet365: football section did not load (title %r) — the DOM "
+                "may have changed (run --dump-bet365) or you may be blocked; "
+                "try BET365_HEADLESS=0 or set BET365_URL_%s to a direct link.",
                 _safe_title(driver), competition.name,
             )
             return False
 
         wanted = COMPETITION_LINKS[competition]
-        for link in driver.find_elements(By.CSS_SELECTOR, SELECTORS["competition_link"]):
-            text = link.text.strip().lower()
+        for link in self._query(driver, SELECTORS["competition_link"]):
+            text = self._text(driver, link).lower()
             if any(w in text for w in wanted):
-                driver.execute_script("arguments[0].click()", link)
-                return self._wait_for(driver, By.CSS_SELECTOR, SELECTORS["event_row"])
+                self._click(driver, link)
+                return self._wait_for(driver, SELECTORS["event_row"])
         log.warning("Bet365: no %s link found in football section", competition.value)
         return False
 
     def _collect_event_urls(self, driver) -> list[str]:
         """Open each listed match once to record its (session-bound) URL."""
-        from selenium.webdriver.common.by import By
-
         urls: list[str] = []
-        count = len(driver.find_elements(By.CSS_SELECTOR, SELECTORS["event_row"]))
+        count = len(self._query(driver, SELECTORS["event_row"]))
         list_url = driver.current_url
         for index in range(min(count, self.max_events)):
-            rows = driver.find_elements(By.CSS_SELECTOR, SELECTORS["event_row"])
+            rows = self._query(driver, SELECTORS["event_row"])
             if index >= len(rows):
                 break
-            driver.execute_script("arguments[0].click()", rows[index])
-            if self._wait_for(driver, By.CSS_SELECTOR, SELECTORS["market_group"]):
+            self._click(driver, rows[index])
+            if self._wait_for(driver, SELECTORS["market_group"]):
                 urls.append(driver.current_url)
             driver.get(list_url)
-            self._wait_for(driver, By.CSS_SELECTOR, SELECTORS["event_row"])
+            self._wait_for(driver, SELECTORS["event_row"])
         return urls
 
     # ------------------------------------------------------------------ #
@@ -280,25 +383,23 @@ class SeleniumBet365Provider(OddsProvider):
     # ------------------------------------------------------------------ #
 
     def _parse_match_page(self, driver, competition: Competition) -> list[PropOdds]:
-        from selenium.webdriver.common.by import By
-
         event_name = self._read_event_name(driver)
         props: list[PropOdds] = []
-        for group in driver.find_elements(By.CSS_SELECTOR, SELECTORS["market_group"]):
-            market = self._classify_group(group)
+        for group in self._query(driver, SELECTORS["market_group"]):
+            market = self._classify_group(driver, group)
             if market is None:
                 continue
             self._expand_group(driver, group)
-            props.extend(self._parse_market_group(group, competition, event_name, market))
+            props.extend(
+                self._parse_market_group(driver, group, competition, event_name, market)
+            )
         if not props:
             log.debug("Bet365: no player shots markets on %r", event_name)
         return props
 
-    def _classify_group(self, group) -> Market | None:
-        from selenium.webdriver.common.by import By
-
-        titles = group.find_elements(By.CSS_SELECTOR, SELECTORS["market_group_title"])
-        title = titles[0].text.strip().lower() if titles else ""
+    def _classify_group(self, driver, group) -> Market | None:
+        titles = self._query(driver, SELECTORS["market_group_title"], group)
+        title = self._text(driver, titles[0]).lower() if titles else ""
         for market, names in MARKET_TITLES.items():
             if title in names:
                 return market
@@ -306,39 +407,38 @@ class SeleniumBet365Provider(OddsProvider):
 
     def _expand_group(self, driver, group) -> None:
         """Open a collapsed market group and click 'Show more' if present."""
-        from selenium.webdriver.common.by import By
-
-        if not group.find_elements(By.CSS_SELECTOR, SELECTORS["market_group_open"]):
-            headers = group.find_elements(By.CSS_SELECTOR, SELECTORS["market_group_title"])
+        is_open = driver.execute_script(
+            "return arguments[0].matches(arguments[1])", group, SELECTORS["market_group_open"]
+        )
+        if not is_open:
+            headers = self._query(driver, SELECTORS["market_group_title"], group)
             if headers:
-                driver.execute_script("arguments[0].click()", headers[0])
+                self._click(driver, headers[0])
                 time.sleep(0.5)
-        for more in group.find_elements(By.CSS_SELECTOR, SELECTORS["show_more"]):
-            driver.execute_script("arguments[0].click()", more)
+        for more in self._query(driver, SELECTORS["show_more"], group):
+            self._click(driver, more)
             time.sleep(0.3)
 
     def _parse_market_group(
-        self, group, competition: Competition, event_name: str, market: Market
+        self, driver, group, competition: Competition, event_name: str, market: Market
     ) -> list[PropOdds]:
         """Parse bet365's player-props grid.
 
         Layout: a label column with player names, then one column per side
         ("Over"/"Under"), each cell stacking the line above the odds.
         """
-        from selenium.webdriver.common.by import By
-
         players = [
-            el.text.strip()
-            for el in group.find_elements(By.CSS_SELECTOR, SELECTORS["player_name"])
-            if el.text.strip()
+            text
+            for el in self._query(driver, SELECTORS["player_name"], group)
+            if (text := self._text(driver, el))
         ]
         if not players:
             return []
 
-        sides: dict[str, list[tuple[float, float]]] = {}
-        for column in group.find_elements(By.CSS_SELECTOR, SELECTORS["column"]):
-            headers = column.find_elements(By.CSS_SELECTOR, SELECTORS["column_header"])
-            header = headers[0].text.strip().lower() if headers else ""
+        sides: dict[str, list[tuple[float | None, float | None]]] = {}
+        for column in self._query(driver, SELECTORS["column"], group):
+            headers = self._query(driver, SELECTORS["column_header"], column)
+            header = self._text(driver, headers[0]).lower() if headers else ""
             if header in ("over", "meer dan"):
                 side = "over"
             elif header in ("under", "minder dan"):
@@ -346,12 +446,10 @@ class SeleniumBet365Provider(OddsProvider):
             else:
                 continue
             cells = []
-            for cell in column.find_elements(By.CSS_SELECTOR, SELECTORS["cell_stacked"]):
-                line = _read_text(cell, SELECTORS["cell_handicap"])
-                odds = _read_text(cell, SELECTORS["cell_odds"])
-                parsed_line = _parse_line(line)
-                parsed_odds = fractional_to_decimal(odds)
-                cells.append((parsed_line, parsed_odds))
+            for cell in self._query(driver, SELECTORS["cell_stacked"], column):
+                line = self._read_text(driver, cell, SELECTORS["cell_handicap"])
+                odds = self._read_text(driver, cell, SELECTORS["cell_odds"])
+                cells.append((_parse_line(line), fractional_to_decimal(odds)))
             sides[side] = cells
 
         props: list[PropOdds] = []
@@ -379,12 +477,12 @@ class SeleniumBet365Provider(OddsProvider):
         return props
 
     def _read_event_name(self, driver) -> str:
-        from selenium.webdriver.common.by import By
-
         for selector in (".sph-EventHeader_Label", ".sip-EventHeader_Label", "h1"):
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-            if elements and elements[0].text.strip():
-                return elements[0].text.strip().replace(" v ", " vs ")
+            elements = self._query(driver, selector)
+            if elements:
+                text = self._text(driver, elements[0])
+                if text:
+                    return text.replace(" v ", " vs ")
         return driver.title
 
     # ------------------------------------------------------------------ #
@@ -395,9 +493,8 @@ class SeleniumBet365Provider(OddsProvider):
         """Open a bet365 page and report what the scraper can see.
 
         Saves rendered HTML and a screenshot, then prints — for the top
-        document AND every iframe (bet365 renders the sports content in a
-        frame the top DOM doesn't show) — per-selector hit counts, frequent
-        CSS classes, shadow-DOM hosts and sample link texts. Everything
+        document and every iframe, shadow DOM included — per-selector hit
+        counts, frequent CSS classes and sample link texts: everything
         needed to repair SELECTORS when bet365 changes its DOM.
         Run via: python -m arb_tool --dump-bet365 [URL]
         """
@@ -417,14 +514,12 @@ class SeleniumBet365Provider(OddsProvider):
             print(f"Saved : {out_prefix}.html, {out_prefix}.png")
 
             self._dump_context(driver, "top document")
-            self._dump_frames(driver, out_prefix, depth=2)
+            self._dump_frames(driver, depth=2)
         finally:
             driver.quit()
 
-    def _dump_frames(self, driver, out_prefix: str, depth: int, label: str = "") -> None:
+    def _dump_frames(self, driver, depth: int, label: str = "") -> None:
         """Recursively dump every iframe's content."""
-        from pathlib import Path
-
         from selenium.webdriver.common.by import By
 
         frames = driver.find_elements(By.TAG_NAME, "iframe")
@@ -439,91 +534,51 @@ class SeleniumBet365Provider(OddsProvider):
                 print(f"\n=== {frame_label} === (cannot enter: {exc})")
                 continue
             try:
-                name = f"{out_prefix}_{frame_label.replace('/', '_')[:60]}.html"
-                name = re.sub(r"[^\w.\-\[\]=]", "_", name)
-                Path(name).write_text(driver.page_source, encoding="utf-8")
-                print(f"(saved {name})")
                 self._dump_context(driver, frame_label)
                 if depth > 1:
-                    self._dump_frames(driver, out_prefix, depth - 1, f"{frame_label} > ")
+                    self._dump_frames(driver, depth - 1, f"{frame_label} > ")
             finally:
                 driver.switch_to.parent_frame()
 
     def _dump_context(self, driver, label: str) -> None:
         """Print scraper-relevant facts about the current document/frame."""
-        from collections import Counter
-
-        from selenium.webdriver.common.by import By
-
         print(f"\n=== {label} ===")
         body_text = driver.execute_script(
             "return document.body ? document.body.innerText.slice(0, 300) : ''"
         )
         print(f"body text: {body_text!r}")
 
-        hits = {
-            name: len(driver.find_elements(By.CSS_SELECTOR, selector))
-            for name, selector in SELECTORS.items()
-        }
-        matched = {name: count for name, count in hits.items() if count}
+        stats = driver.execute_script(_DUMP_STATS_JS, SELECTORS)
+        print(f"open shadow roots: {stats['shadowRoots']}")
+        matched = {name: count for name, count in stats["hits"].items() if count}
         print(f"SELECTORS hits: {matched if matched else 'none'}")
 
-        shadow_hosts = driver.execute_script(
-            "return Array.from(document.querySelectorAll('*'))"
-            ".filter(e => e.shadowRoot).slice(0, 10)"
-            ".map(e => e.tagName + '.' + (e.className || ''))"
-        )
-        if shadow_hosts:
-            print(f"shadow-DOM hosts: {shadow_hosts}")
-
-        tokens: Counter = Counter()
-        for attr in re.findall(r'class="([^"]*)"', driver.page_source):
-            for token in attr.split():
-                if re.search(
-                    r"Coupon|Market|Particip|Fixture|Label|Link|Button|Header|Odds|Classification",
-                    token,
-                ):
-                    tokens[token] += 1
         print("frequent classes:")
-        for token, count in tokens.most_common(40):
+        ranked = sorted(stats["classes"].items(), key=lambda kv: -kv[1])
+        for token, count in ranked[:50]:
             print(f"{count:>5}  {token}")
 
-        seen: set = set()
-        elements = driver.find_elements(
-            By.CSS_SELECTOR, "a, [class*='Link'], [class*='Button'], [class*='Label']"
-        )
         print("sample clickable texts:")
-        for element in elements[:400]:
-            try:
-                text = element.text.strip().replace("\n", " / ")[:60]
-            except Exception:
-                continue
-            if text and text not in seen:
-                seen.add(text)
-                print(f"  {text}")
-            if len(seen) >= 30:
-                break
+        for text in stats["texts"]:
+            print(f"  {text}")
 
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
 
     def _dismiss_cookies(self, driver) -> None:
-        from selenium.webdriver.common.by import By
-
-        for button in driver.find_elements(By.CSS_SELECTOR, SELECTORS["cookie_accept"]):
+        for button in self._query(driver, SELECTORS["cookie_accept"]):
             try:
-                button.click()
+                self._click(driver, button)
                 time.sleep(0.3)
             except Exception:  # pragma: no cover - best effort
                 pass
 
-    def _wait_for(self, driver, by, selector: str) -> bool:
-        """Wait until ``selector`` exists, searching iframes too.
+    def _wait_for(self, driver, selector: str) -> bool:
+        """Wait until ``selector`` exists, searching iframes and shadow DOM.
 
-        bet365 renders the sports content inside a frame the top document
-        doesn't expose; on success the driver context is left switched to
-        whichever document contains the selector.
+        On success the driver context is left switched to whichever
+        document contains the selector.
         """
         from selenium.webdriver.support.ui import WebDriverWait
 
@@ -537,8 +592,6 @@ class SeleniumBet365Provider(OddsProvider):
 
     def _enter_context_with(self, driver, selector: str, depth: int = 2) -> bool:
         """Switch to the (i)frame containing ``selector``; False if absent."""
-        from selenium.webdriver.common.by import By
-
         driver.switch_to.default_content()
         if self._descend_to(driver, selector, depth):
             return True
@@ -548,7 +601,7 @@ class SeleniumBet365Provider(OddsProvider):
     def _descend_to(self, driver, selector: str, depth: int) -> bool:
         from selenium.webdriver.common.by import By
 
-        if driver.find_elements(By.CSS_SELECTOR, selector):
+        if self._query(driver, selector):
             return True
         if depth <= 0:
             return False
@@ -562,12 +615,9 @@ class SeleniumBet365Provider(OddsProvider):
             driver.switch_to.parent_frame()
         return False
 
-
-def _read_text(element, selector: str) -> str:
-    from selenium.webdriver.common.by import By
-
-    found = element.find_elements(By.CSS_SELECTOR, selector)
-    return found[0].text if found else ""
+    def _read_text(self, driver, element, selector: str) -> str:
+        found = self._query(driver, selector, element)
+        return self._text(driver, found[0]) if found else ""
 
 
 def _parse_line(text: str) -> float | None:

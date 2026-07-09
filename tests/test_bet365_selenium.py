@@ -38,6 +38,27 @@ def driver():
     drv.quit()
 
 
+def test_deep_query_pierces_closed_shadow_dom(driver):
+    """bet365 hides content in closed shadow roots; the injected
+    attachShadow override plus the deep query must still find it."""
+    provider = SeleniumBet365Provider()
+    driver.get("about:blank")
+    driver.execute_script(
+        """
+        const host = document.createElement('div');
+        document.body.appendChild(host);
+        const root = host.attachShadow({mode: 'closed'});
+        const inner = document.createElement('div');
+        inner.className = 'gl-MarketGroup';
+        inner.textContent = 'hidden market';
+        root.appendChild(inner);
+        """
+    )
+    found = provider._query(driver, ".gl-MarketGroup")
+    assert len(found) == 1
+    assert provider._text(driver, found[0]) == "hidden market"
+
+
 def test_parse_match_page_from_fixture(driver):
     provider = SeleniumBet365Provider()
     driver.get(FIXTURE.as_uri())
