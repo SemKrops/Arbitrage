@@ -4,3 +4,7 @@ __pycache__/
 .env
 .venv/
 venv/
+
+# bet365 diagnostic dump artifacts
+bet365_dump*.html
+bet365_dump*.png
