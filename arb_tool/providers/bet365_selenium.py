@@ -628,18 +628,27 @@ class SeleniumBet365Provider(OddsProvider):
     def _open_shots_tab(self, driver) -> None:
         """Click the match page's 'Shots' market-group tab and let it render."""
         self._wait_for(driver, ".sph-MarketGroupNavBarButton, .gl-MarketGroupPod")
+        tabs = [self._text(driver, b) for b in
+                self._query(driver, ".sph-MarketGroupNavBarButton_Content")]
+        clicked = False
         for button in self._query(driver, ".sph-MarketGroupNavBarButton_Content"):
-            label = self._text(driver, button).lower()
-            if label in ("shots", "schoten"):
+            if self._text(driver, button).lower() in ("shots", "schoten"):
                 self._click(driver, button)
+                clicked = True
                 break
+        if not clicked:
+            log.warning(
+                "Bet365: no 'Shots' tab on this match — player shots markets "
+                "may not be offered yet (they usually open ~1-2 days before "
+                "kickoff). Tabs present: %s", tabs or "none",
+            )
         self._wait_for(driver, ".gl-MarketGroupPod")
         # Scroll the shots pods into view so bet365 renders their odds cells.
         try:
             driver.execute_script(_EXPAND_SHOTS_JS)
         except Exception:  # pragma: no cover - best effort
             pass
-        time.sleep(2)
+        time.sleep(3)
 
     # ------------------------------------------------------------------ #
     # Parsing
@@ -662,7 +671,18 @@ class SeleniumBet365Provider(OddsProvider):
                 continue  # not a plain shots milestone grid (e.g. Over/Under, Headed)
             props.extend(self._pod_to_props(pod, competition, event_name, market))
         if not props:
-            log.debug("Bet365: no shots milestone markets parsed on %r", event_name)
+            # Report what was on the page so 0-prop runs are diagnosable:
+            # is it "no shots pods" (markets closed / tab not open) vs "pods
+            # present but titles/odds didn't parse" (selectors need updating)?
+            all_pods = driver.execute_script(
+                "return Array.from(document.querySelectorAll('.gl-MarketGroupPod'))"
+                ".map(p => (p.innerText||'').split('\\n')[0]).slice(0, 30)"
+            )
+            log.warning(
+                "Bet365: no shots milestone props parsed on %r. Shots-grid "
+                "pods seen by extractor: %d. All market pods on page (%d): %s",
+                event_name, len(pods), len(all_pods), all_pods or "none",
+            )
         return props
 
     def _pod_to_props(
