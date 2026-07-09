@@ -211,19 +211,18 @@ return {
 # On-screen texts used to locate the sports-content DOM by anchor.
 _DUMP_ANCHORS = ["WK 2026", "Frankrijk v Marokko", "Alle sporten", "Aankomend", "Live"]
 
-# Market-title substrings whose surrounding subtree we dump on a match page,
-# so the player/line/odds layout can be reverse-engineered despite bet365's
-# obfuscated class names.
-_MARKET_SUBTREE_TERMS = [
-    "Schoten", "schoten", "Shots", "shots", "op doel", "on target",
-]
+# Container selectors whose subtree we dump on a match page, so the
+# player/line/odds grid can be reverse-engineered. bet365's odds grid uses
+# stable gl-/srb- classes (only the left-nav sidebar is obfuscated).
+_MARKET_SUBTREE_SELECTORS = [".gl-MarketGroupPod", ".gl-MarketGroup", ".gl-Market_General"]
 
-# For each element whose text contains one of the terms, return a compact
-# representation of its enclosing market subtree: depth, tag, class list and
-# short text for every descendant, so structure and odds cells are visible.
+# Dump the subtree of the first few market-pod containers: depth, tag,
+# class list and short text for each descendant, revealing the grid layout
+# (pod title, column headers, player rows, odds cells).
 _MARKET_SUBTREE_JS = """
-const terms = arguments[0];
-const maxNodes = 120;
+const selectors = arguments[0];
+const maxPods = 3;
+const maxNodes = 90;
 
 const roots = [];
 function collectRoots(root) {
@@ -239,38 +238,28 @@ function clsOf(node) {
   return String(c).trim();
 }
 
-// Find the smallest element whose own text matches a term, then climb a few
-// levels to a container likely to hold the whole market (players + odds).
-function findMarketContainer(term) {
+let pods = [];
+for (const selector of selectors) {
   for (const root of roots) {
-    for (const el of root.querySelectorAll('*')) {
-      const own = Array.from(el.childNodes)
-        .filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
-      if (own.includes(term)) {
-        let node = el;
-        for (let i = 0; i < 4 && node.parentElement; i++) node = node.parentElement;
-        return node;
-      }
-    }
+    for (const el of root.querySelectorAll(selector)) pods.push(el);
   }
-  return null;
+  if (pods.length) break;  // use the first selector that matches anything
 }
+pods = pods.slice(0, maxPods);
 
 const results = [];
-const seen = new Set();
-for (const term of terms) {
-  const container = findMarketContainer(term);
-  if (!container || seen.has(container)) continue;
-  seen.add(container);
+for (const pod of pods) {
   const nodes = [];
   (function walk(node, depth) {
     if (nodes.length >= maxNodes) return;
+    const tag = node.tagName.toLowerCase();
+    if (tag === 'script' || tag === 'style' || tag === 'svg') return;
     const text = Array.from(node.childNodes)
       .filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').trim().slice(0, 40);
-    nodes.push({ depth: depth, tag: node.tagName.toLowerCase(), cls: clsOf(node), text: text });
+    nodes.push({ depth: depth, tag: tag, cls: clsOf(node), text: text });
     for (const child of node.children) walk(child, depth + 1);
-  })(container, 0);
-  results.push({ term: term, nodeCount: nodes.length, nodes: nodes });
+  })(pod, 0);
+  results.push({ selector: clsOf(pod), nodeCount: nodes.length, nodes: nodes });
 }
 return results;
 """
@@ -644,17 +633,17 @@ class SeleniumBet365Provider(OddsProvider):
             driver.quit()
 
     def _dump_market_subtree(self, driver) -> None:
-        """Print the DOM subtree around any player-shots market on the page."""
-        results = driver.execute_script(_MARKET_SUBTREE_JS, _MARKET_SUBTREE_TERMS)
+        """Print the DOM subtree of the market pods (the player-props grid)."""
+        results = driver.execute_script(_MARKET_SUBTREE_JS, _MARKET_SUBTREE_SELECTORS)
         if not results:
             print(
-                "\nmarket subtree: no shots-market text found on this page "
-                "(navigate to a match with player shots open and use --wait)"
+                "\nmarket subtree: no market-pod containers found on this page "
+                "(navigate to a match's Shots tab and use --wait)"
             )
             return
-        for result in results:
-            print(f"\nmarket subtree for term {result['term']!r} "
-                  f"({result['nodeCount']} nodes):")
+        for index, result in enumerate(results):
+            print(f"\nmarket pod #{index} ({result['selector']!r}, "
+                  f"{result['nodeCount']} nodes):")
             for node in result["nodes"]:
                 indent = "  " * node["depth"]
                 cls = f".{node['cls'].replace(' ', '.')}" if node["cls"] else ""
