@@ -394,62 +394,115 @@ class SeleniumBet365Provider(OddsProvider):
     def dump_page(self, url: str | None = None, out_prefix: str = "bet365_dump") -> None:
         """Open a bet365 page and report what the scraper can see.
 
-        Saves the rendered HTML and a screenshot, then prints per-selector
-        hit counts and the CSS class names / link texts present — everything
-        needed to repair the SELECTORS dict when bet365 changes its DOM.
+        Saves rendered HTML and a screenshot, then prints — for the top
+        document AND every iframe (bet365 renders the sports content in a
+        frame the top DOM doesn't show) — per-selector hit counts, frequent
+        CSS classes, shadow-DOM hosts and sample link texts. Everything
+        needed to repair SELECTORS when bet365 changes its DOM.
         Run via: python -m arb_tool --dump-bet365 [URL]
         """
-        from collections import Counter
         from pathlib import Path
-
-        from selenium.webdriver.common.by import By
 
         driver = self._build_driver()
         try:
             driver.get(url or f"{self.base_url}/#/AS/B1/")
-            time.sleep(10)  # let the SPA render
+            time.sleep(12)  # let the SPA render
             self._dismiss_cookies(driver)
             time.sleep(2)
 
-            html = driver.page_source
-            Path(f"{out_prefix}.html").write_text(html, encoding="utf-8")
+            Path(f"{out_prefix}.html").write_text(driver.page_source, encoding="utf-8")
             driver.save_screenshot(f"{out_prefix}.png")
-
             print(f"Title : {driver.title}")
             print(f"URL   : {driver.current_url}")
             print(f"Saved : {out_prefix}.html, {out_prefix}.png")
 
-            print("\n--- SELECTORS hit counts ---")
-            for name, selector in SELECTORS.items():
-                count = len(driver.find_elements(By.CSS_SELECTOR, selector))
-                print(f"{name:<22} {count:>4}  ({selector})")
-
-            print("\n--- frequent CSS classes (interesting families) ---")
-            tokens: Counter = Counter()
-            for attr in re.findall(r'class="([^"]*)"', html):
-                for token in attr.split():
-                    if re.search(
-                        r"Coupon|Market|Particip|Fixture|Label|Link|Button|Header|Odds|Classification",
-                        token,
-                    ):
-                        tokens[token] += 1
-            for token, count in tokens.most_common(50):
-                print(f"{count:>5}  {token}")
-
-            print("\n--- sample clickable texts ---")
-            seen: set = set()
-            elements = driver.find_elements(
-                By.CSS_SELECTOR, "a, [class*='Link'], [class*='Button'], [class*='Label']"
-            )
-            for element in elements[:400]:
-                text = element.text.strip().replace("\n", " / ")[:60]
-                if text and text not in seen:
-                    seen.add(text)
-                    print(f"  {text}")
-                if len(seen) >= 40:
-                    break
+            self._dump_context(driver, "top document")
+            self._dump_frames(driver, out_prefix, depth=2)
         finally:
             driver.quit()
+
+    def _dump_frames(self, driver, out_prefix: str, depth: int, label: str = "") -> None:
+        """Recursively dump every iframe's content."""
+        from pathlib import Path
+
+        from selenium.webdriver.common.by import By
+
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+        if frames:
+            print(f"\n*** {len(frames)} iframe(s) under {label or 'top document'} ***")
+        for index, frame in enumerate(frames):
+            src = (frame.get_attribute("src") or "<no src>")[:100]
+            frame_label = f"{label}iframe[{index}] src={src}"
+            try:
+                driver.switch_to.frame(frame)
+            except Exception as exc:
+                print(f"\n=== {frame_label} === (cannot enter: {exc})")
+                continue
+            try:
+                name = f"{out_prefix}_{frame_label.replace('/', '_')[:60]}.html"
+                name = re.sub(r"[^\w.\-\[\]=]", "_", name)
+                Path(name).write_text(driver.page_source, encoding="utf-8")
+                print(f"(saved {name})")
+                self._dump_context(driver, frame_label)
+                if depth > 1:
+                    self._dump_frames(driver, out_prefix, depth - 1, f"{frame_label} > ")
+            finally:
+                driver.switch_to.parent_frame()
+
+    def _dump_context(self, driver, label: str) -> None:
+        """Print scraper-relevant facts about the current document/frame."""
+        from collections import Counter
+
+        from selenium.webdriver.common.by import By
+
+        print(f"\n=== {label} ===")
+        body_text = driver.execute_script(
+            "return document.body ? document.body.innerText.slice(0, 300) : ''"
+        )
+        print(f"body text: {body_text!r}")
+
+        hits = {
+            name: len(driver.find_elements(By.CSS_SELECTOR, selector))
+            for name, selector in SELECTORS.items()
+        }
+        matched = {name: count for name, count in hits.items() if count}
+        print(f"SELECTORS hits: {matched if matched else 'none'}")
+
+        shadow_hosts = driver.execute_script(
+            "return Array.from(document.querySelectorAll('*'))"
+            ".filter(e => e.shadowRoot).slice(0, 10)"
+            ".map(e => e.tagName + '.' + (e.className || ''))"
+        )
+        if shadow_hosts:
+            print(f"shadow-DOM hosts: {shadow_hosts}")
+
+        tokens: Counter = Counter()
+        for attr in re.findall(r'class="([^"]*)"', driver.page_source):
+            for token in attr.split():
+                if re.search(
+                    r"Coupon|Market|Particip|Fixture|Label|Link|Button|Header|Odds|Classification",
+                    token,
+                ):
+                    tokens[token] += 1
+        print("frequent classes:")
+        for token, count in tokens.most_common(40):
+            print(f"{count:>5}  {token}")
+
+        seen: set = set()
+        elements = driver.find_elements(
+            By.CSS_SELECTOR, "a, [class*='Link'], [class*='Button'], [class*='Label']"
+        )
+        print("sample clickable texts:")
+        for element in elements[:400]:
+            try:
+                text = element.text.strip().replace("\n", " / ")[:60]
+            except Exception:
+                continue
+            if text and text not in seen:
+                seen.add(text)
+                print(f"  {text}")
+            if len(seen) >= 30:
+                break
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -466,15 +519,48 @@ class SeleniumBet365Provider(OddsProvider):
                 pass
 
     def _wait_for(self, driver, by, selector: str) -> bool:
+        """Wait until ``selector`` exists, searching iframes too.
+
+        bet365 renders the sports content inside a frame the top document
+        doesn't expose; on success the driver context is left switched to
+        whichever document contains the selector.
+        """
         from selenium.webdriver.support.ui import WebDriverWait
 
         try:
             WebDriverWait(driver, self.page_timeout).until(
-                lambda d: d.find_elements(by, selector)
+                lambda d: self._enter_context_with(d, selector)
             )
             return True
         except Exception:
             return False
+
+    def _enter_context_with(self, driver, selector: str, depth: int = 2) -> bool:
+        """Switch to the (i)frame containing ``selector``; False if absent."""
+        from selenium.webdriver.common.by import By
+
+        driver.switch_to.default_content()
+        if self._descend_to(driver, selector, depth):
+            return True
+        driver.switch_to.default_content()
+        return False
+
+    def _descend_to(self, driver, selector: str, depth: int) -> bool:
+        from selenium.webdriver.common.by import By
+
+        if driver.find_elements(By.CSS_SELECTOR, selector):
+            return True
+        if depth <= 0:
+            return False
+        for frame in driver.find_elements(By.TAG_NAME, "iframe"):
+            try:
+                driver.switch_to.frame(frame)
+            except Exception:
+                continue
+            if self._descend_to(driver, selector, depth - 1):
+                return True
+            driver.switch_to.parent_frame()
+        return False
 
 
 def _read_text(element, selector: str) -> str:
