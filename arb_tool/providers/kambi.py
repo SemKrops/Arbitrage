@@ -12,6 +12,10 @@ competition paths) is overridable via environment variables:
     KAMBI_PATH_LA_LIGA         default football/spain/la_liga
     KAMBI_PATH_WORLD_CUP       default football/world_cup_2026
 
+When a competition path 404s (Kambi renames term keys, e.g. per World Cup
+edition), the provider automatically looks up the real path in Kambi's
+group tree (group.json) and retries with it.
+
 If Unibet moves off Kambi or the shape changes, switch to the file provider
 (UNIBET_PROVIDER=file) and feed odds from another source.
 """
@@ -35,6 +39,12 @@ DEFAULT_PATHS = {
     Competition.LA_LIGA: "football/spain/la_liga",
     Competition.WORLD_CUP: "football/world_cup_2026",
 }
+
+# Groups that look like a World Cup but aren't the men's main tournament.
+_WORLD_CUP_EXCLUDE = (
+    "qualif", "kwalificatie", "women", "vrouwen", "u17", "u19", "u20", "u21",
+    "youth", "jeugd", "futsal", "beach", "club", "esoccer", "e-soccer",
+)
 
 # Criterion labels for player shots markets, English and Dutch variants.
 _SHOTS_ON_TARGET_RE = re.compile(r"shots?\s+on\s+target|schoten\s+op\s+doel", re.IGNORECASE)
@@ -69,9 +79,63 @@ class KambiUnibetProvider(OddsProvider):
         return response.json()
 
     def _list_events(self, competition: Competition) -> list[dict]:
-        data = self._get(f"listView/{self.paths[competition]}/all/matches.json")
+        try:
+            data = self._get(f"listView/{self.paths[competition]}/all/matches.json")
+        except requests.HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 404:
+                raise
+            # Path guess is stale (Kambi renames competition term keys, e.g.
+            # for each World Cup edition) — look up the real one in the
+            # group tree and retry.
+            discovered = self._discover_path(competition)
+            if not discovered or discovered == self.paths[competition]:
+                raise
+            log.info(
+                "Unibet/Kambi: resolved %s to path %r", competition.value, discovered
+            )
+            self.paths[competition] = discovered
+            data = self._get(f"listView/{discovered}/all/matches.json")
         events = [item["event"] for item in data.get("events", []) if "event" in item]
+        if not events:
+            log.info(
+                "Unibet/Kambi: no upcoming %s matches listed (off-season or "
+                "markets not open yet)",
+                competition.value,
+            )
         return events[: self.max_events]
+
+    def _discover_path(self, competition: Competition) -> str | None:
+        """Find the competition's listView path in Kambi's group tree."""
+        data = self._get("group.json")
+        football = next(
+            (
+                group
+                for group in data.get("group", {}).get("groups", [])
+                if group.get("termKey") == "football"
+                or (group.get("name") or "").lower() in ("football", "voetbal")
+            ),
+            None,
+        )
+        if football is None:
+            return None
+
+        candidates: list[tuple[dict, str]] = []
+
+        def walk(group: dict, prefix: str) -> None:
+            for child in group.get("groups") or []:
+                term = child.get("termKey") or ""
+                path = f"{prefix}/{term}" if term else prefix
+                candidates.append((child, path))
+                walk(child, path)
+
+        walk(football, football.get("termKey", "football"))
+
+        best: tuple[tuple, str] | None = None
+        for group, path in candidates:
+            score = _match_competition(competition, group, path)
+            if score is not None and (best is None or score > best[0]):
+                best = (score, path)
+        return best[1] if best else None
 
     def fetch_props(self, competitions: tuple[Competition, ...]) -> list[PropOdds]:
         props: list[PropOdds] = []
@@ -140,6 +204,40 @@ class KambiUnibetProvider(OddsProvider):
             over=over_odds,
             under=under_odds,
         )
+
+
+def _match_competition(
+    competition: Competition, group: dict, path: str
+) -> tuple | None:
+    """Score a group-tree node as a candidate for the competition.
+
+    Returns None for non-matches; otherwise a sortable score tuple where a
+    higher tuple means a better match.
+    """
+    name = (group.get("name") or "").lower()
+    term = (group.get("termKey") or "").lower()
+    path_l = path.lower()
+
+    if competition is Competition.PREMIER_LEAGUE:
+        if term == "premier_league" or name == "premier league":
+            # Many countries have a "Premier League"; England's is the one.
+            return ("england" in path_l or "engeland" in path_l, term == "premier_league")
+    elif competition is Competition.LA_LIGA:
+        if term in ("la_liga", "laliga") or name in ("la liga", "laliga"):
+            return ("spain" in path_l or "spanje" in path_l, term.startswith("la"))
+    elif competition is Competition.WORLD_CUP:
+        text = f"{term} {name}"
+        is_wc = (
+            "world_cup" in term
+            or "world cup" in name
+            or name == "wk"
+            or name.startswith("wk ")
+            or "wereldkampioenschap" in name
+        )
+        if is_wc and not any(word in text for word in _WORLD_CUP_EXCLUDE):
+            # Prefer the current edition and shallower (top-level) groups.
+            return ("2026" in text, -path.count("/"))
+    return None
 
 
 def _classify_market(criterion_label: str) -> Market | None:
