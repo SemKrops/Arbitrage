@@ -211,18 +211,49 @@ return {
 # On-screen texts used to locate the sports-content DOM by anchor.
 _DUMP_ANCHORS = ["WK 2026", "Frankrijk v Marokko", "Alle sporten", "Aankomend", "Live"]
 
+# Scroll every shots-related market pod into view and expand it, so bet365
+# lazily renders the odds cells (collapsed/off-screen markets stay empty).
+_EXPAND_SHOTS_JS = """
+const roots = [];
+function collectRoots(root) {
+  if (!root.querySelectorAll) return;
+  roots.push(root);
+  for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collectRoots(el.shadowRoot);
+}
+collectRoots(document);
+
+let expanded = 0;
+for (const root of roots) {
+  for (const pod of root.querySelectorAll('.gl-MarketGroupPod')) {
+    const text = (pod.innerText || '').toLowerCase();
+    if (!(text.includes('shots') || text.includes('schoten'))) continue;
+    pod.scrollIntoView({ block: 'center' });
+    // Expand if no odds are rendered yet.
+    if (!pod.querySelector('.gl-ParticipantOddsOnly_Odds, .gl-Participant_General')) {
+      const header = pod.querySelector(
+        '.cm-MarketGroupWithIconsButton, .srb-ButtonWithBetBuilderIcon, [class*="_Open"]'
+      );
+      if (header) { header.click(); expanded++; }
+    }
+  }
+}
+return expanded;
+"""
+
 # Container selectors whose subtree we dump on a match page, so the
 # player/line/odds grid can be reverse-engineered. bet365's odds grid uses
 # stable gl-/srb- classes (only the left-nav sidebar is obfuscated).
 _MARKET_SUBTREE_SELECTORS = [".gl-MarketGroupPod", ".gl-MarketGroup", ".gl-Market_General"]
 
-# Dump the subtree of the first few market-pod containers: depth, tag,
-# class list and short text for each descendant, revealing the grid layout
-# (pod title, column headers, player rows, odds cells).
+# Dump the subtree of shots market-pod containers: depth, tag, class list
+# and short text for each descendant, revealing the grid layout (pod title,
+# column headers, player rows, odds cells). Team-kit images and recent-form
+# stat blocks are skipped so the odds columns fit in the node budget.
 _MARKET_SUBTREE_JS = """
 const selectors = arguments[0];
-const maxPods = 3;
-const maxNodes = 90;
+const maxPods = 4;
+const maxNodes = 160;
+const skipClass = /^(tk-|prs-)|_Asset|TeamKit/;
 
 const roots = [];
 function collectRoots(root) {
@@ -241,7 +272,10 @@ function clsOf(node) {
 let pods = [];
 for (const selector of selectors) {
   for (const root of roots) {
-    for (const el of root.querySelectorAll(selector)) pods.push(el);
+    for (const el of root.querySelectorAll(selector)) {
+      const text = (el.innerText || '').toLowerCase();
+      if (text.includes('shots') || text.includes('schoten')) pods.push(el);
+    }
   }
   if (pods.length) break;  // use the first selector that matches anything
 }
@@ -253,7 +287,8 @@ for (const pod of pods) {
   (function walk(node, depth) {
     if (nodes.length >= maxNodes) return;
     const tag = node.tagName.toLowerCase();
-    if (tag === 'script' || tag === 'style' || tag === 'svg') return;
+    if (tag === 'script' || tag === 'style' || tag === 'svg' || tag === 'img') return;
+    if (skipClass.test(clsOf(node))) return;
     const text = Array.from(node.childNodes)
       .filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').trim().slice(0, 40);
     nodes.push({ depth: depth, tag: tag, cls: clsOf(node), text: text });
@@ -633,7 +668,14 @@ class SeleniumBet365Provider(OddsProvider):
             driver.quit()
 
     def _dump_market_subtree(self, driver) -> None:
-        """Print the DOM subtree of the market pods (the player-props grid)."""
+        """Print the DOM subtree of the shots market pods (the props grid)."""
+        try:
+            expanded = driver.execute_script(_EXPAND_SHOTS_JS)
+            if expanded:
+                print(f"\n(expanded {expanded} shots market(s), waiting for render)")
+                time.sleep(3)
+        except Exception as exc:  # pragma: no cover - best effort
+            log.debug("Bet365: could not pre-expand shots markets: %s", exc)
         results = driver.execute_script(_MARKET_SUBTREE_JS, _MARKET_SUBTREE_SELECTORS)
         if not results:
             print(
