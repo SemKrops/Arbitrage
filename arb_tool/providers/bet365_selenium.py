@@ -211,6 +211,61 @@ return {
 # On-screen texts used to locate the sports-content DOM by anchor.
 _DUMP_ANCHORS = ["WK 2026", "Frankrijk v Marokko", "Alle sporten", "Aankomend", "Live"]
 
+# Targeted odds extractor: for each shots market pod, pull the title, player
+# names, column headers (the lines) and the actual odds cells — both the
+# Over/Under "stacked" cells (handicap + odds) and the milestone "odds only"
+# cells. Returns counts plus samples so the grid arrangement (column-major,
+# players-per-column) can be confirmed and mapped to PropOdds.
+_SHOTS_EXTRACT_JS = """
+const roots = [];
+function collectRoots(root) {
+  if (!root.querySelectorAll) return;
+  roots.push(root);
+  for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collectRoots(el.shadowRoot);
+}
+collectRoots(document);
+
+function txt(el) { return el ? (el.innerText || el.textContent || '').trim() : ''; }
+
+const pods = [];
+for (const root of roots) {
+  for (const pod of root.querySelectorAll('.gl-MarketGroupPod')) {
+    const podText = (pod.innerText || '').toLowerCase();
+    if (!(podText.includes('shots') || podText.includes('schoten'))) continue;
+
+    const title = txt(pod.querySelector(
+      '.cm-MarketGroupWithIconsButton_Text, .srb-ButtonWithBetBuilderIcon_Text'
+    ));
+    const players = Array.from(pod.querySelectorAll('.srb-ParticipantLabelWithTeam_Name'))
+      .map(txt);
+    const headers = Array.from(pod.querySelectorAll('.gl-Market_General-columnheader'))
+      .map(txt).filter(t => t);
+
+    const stacked = Array.from(pod.querySelectorAll('.gl-ParticipantCenteredStacked')).map(c => ({
+      line: txt(c.querySelector('.gl-ParticipantCenteredStacked_Handicap')),
+      odds: txt(c.querySelector('.gl-ParticipantCenteredStacked_Odds')),
+      susp: c.className.includes('Suspended'),
+    }));
+    const oddsOnly = Array.from(pod.querySelectorAll('.gl-ParticipantOddsOnly')).map(c => ({
+      odds: txt(c.querySelector('.gl-ParticipantOddsOnly_Odds')) || txt(c),
+      susp: c.className.includes('Suspended'),
+    }));
+
+    pods.push({
+      title: title,
+      playerCount: players.length,
+      players: players.slice(0, 6),
+      headers: headers,
+      stackedCount: stacked.length,
+      stacked: stacked.filter(c => c.odds).slice(0, 12),
+      oddsOnlyCount: oddsOnly.length,
+      oddsOnly: oddsOnly.filter(c => c.odds).slice(0, 16),
+    });
+  }
+}
+return pods;
+"""
+
 # Scroll every shots-related market pod into view and expand it, so bet365
 # lazily renders the odds cells (collapsed/off-screen markets stay empty).
 _EXPAND_SHOTS_JS = """
@@ -662,10 +717,30 @@ class SeleniumBet365Provider(OddsProvider):
             print(f"Saved : {out_prefix}.html, {out_prefix}.png")
 
             self._dump_context(driver, "top document")
+            self._dump_shots_odds(driver)
             self._dump_market_subtree(driver)
             self._dump_frames(driver, depth=2)
         finally:
             driver.quit()
+
+    def _dump_shots_odds(self, driver) -> None:
+        """Print the actual odds extracted from each shots market pod."""
+        try:
+            driver.execute_script(_EXPAND_SHOTS_JS)
+            time.sleep(2)
+        except Exception:  # pragma: no cover - best effort
+            pass
+        pods = driver.execute_script(_SHOTS_EXTRACT_JS)
+        print("\n===== SHOTS ODDS EXTRACTION =====")
+        if not pods:
+            print("(no shots market pods found)")
+            return
+        for pod in pods:
+            print(f"\n• {pod['title']!r}")
+            print(f"    players: {pod['playerCount']} -> {pod['players']}")
+            print(f"    column headers: {pod['headers']}")
+            print(f"    stacked O/U cells: {pod['stackedCount']} -> {pod['stacked']}")
+            print(f"    odds-only cells: {pod['oddsOnlyCount']} -> {pod['oddsOnly']}")
 
     def _dump_market_subtree(self, driver) -> None:
         """Print the DOM subtree of the shots market pods (the props grid)."""
