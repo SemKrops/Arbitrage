@@ -104,8 +104,31 @@ class KambiUnibetProvider(OddsProvider):
             )
         return events[: self.max_events]
 
+    def search_groups(self, query: str) -> list[tuple[str, str]]:
+        """Search Kambi's football group tree by name or term key.
+
+        Returns (listView path, display name) tuples — a diagnostic helper
+        exposed via ``python -m arb_tool --find-competition <query>``.
+        """
+        query = query.lower()
+        return [
+            (path, group.get("name") or "")
+            for group, path in self._football_groups()
+            if query in (group.get("name") or "").lower()
+            or query in (group.get("termKey") or "").lower()
+        ]
+
     def _discover_path(self, competition: Competition) -> str | None:
         """Find the competition's listView path in Kambi's group tree."""
+        best: tuple[tuple, str] | None = None
+        for group, path in self._football_groups():
+            score = _match_competition(competition, group, path)
+            if score is not None and (best is None or score > best[0]):
+                best = (score, path)
+        return best[1] if best else None
+
+    def _football_groups(self) -> list[tuple[dict, str]]:
+        """Flatten the football subtree of group.json to (group, path) pairs."""
         data = self._get("group.json")
         football = next(
             (
@@ -117,7 +140,7 @@ class KambiUnibetProvider(OddsProvider):
             None,
         )
         if football is None:
-            return None
+            return []
 
         candidates: list[tuple[dict, str]] = []
 
@@ -129,13 +152,7 @@ class KambiUnibetProvider(OddsProvider):
                 walk(child, path)
 
         walk(football, football.get("termKey", "football"))
-
-        best: tuple[tuple, str] | None = None
-        for group, path in candidates:
-            score = _match_competition(competition, group, path)
-            if score is not None and (best is None or score > best[0]):
-                best = (score, path)
-        return best[1] if best else None
+        return candidates
 
     def fetch_props(self, competitions: tuple[Competition, ...]) -> list[PropOdds]:
         props: list[PropOdds] = []

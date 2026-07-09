@@ -53,6 +53,12 @@ def main(argv: list[str] | None = None) -> int:
         "and alert a Discord channel.",
     )
     parser.add_argument("--once", action="store_true", help="run a single scan and exit")
+    parser.add_argument(
+        "--find-competition",
+        metavar="QUERY",
+        help="search Unibet/Kambi's football competition tree by name "
+        "(e.g. 'world', 'wk') and print the matching paths, then exit",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
 
@@ -62,6 +68,23 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     config = Config.from_env()
+
+    if args.find_competition:
+        from .providers.kambi import KambiUnibetProvider
+
+        matches = KambiUnibetProvider().search_groups(args.find_competition)
+        if not matches:
+            print(f"No football competitions matching {args.find_competition!r}")
+            return 1
+        width = max(len(path) for path, _ in matches)
+        for path, name in matches:
+            print(f"{path:<{width}}  {name}")
+        print(
+            "\nUse a path via KAMBI_PATH_PREMIER_LEAGUE / KAMBI_PATH_LA_LIGA / "
+            "KAMBI_PATH_WORLD_CUP in .env"
+        )
+        return 0
+
     notifier = DiscordNotifier(config.discord_webhook_url)
     seen: set = set()
 

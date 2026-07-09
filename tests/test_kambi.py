@@ -122,6 +122,17 @@ def test_list_events_falls_back_to_discovery_on_404(monkeypatch):
     assert provider.paths[Competition.WORLD_CUP] == "football/fifa_world_cup_2026"
 
 
+def test_search_groups(monkeypatch):
+    provider = make_provider(monkeypatch, {"group.json": GROUP_TREE})
+    results = provider.search_groups("world")
+    paths = [path for path, _ in results]
+    assert "football/fifa_world_cup_2026" in paths
+    assert "football/world_cup_qualifying_europe" in paths
+    # Dutch query matches the WK group by name.
+    assert provider.search_groups("wk") == [("football/fifa_world_cup_2026", "WK 2026")]
+    assert provider.search_groups("tennis") == []
+
+
 def test_classify_market_labels():
     assert _classify_market("Total Shots on Target by Mohamed Salah") is Market.SHOTS_ON_TARGET
     assert _classify_market("Schoten op doel van speler") is Market.SHOTS_ON_TARGET
