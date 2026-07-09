@@ -96,9 +96,11 @@ COMPETITION_LINKS = {
 }
 
 # Injected before any page script runs: bet365 creates its shadow roots
-# closed, which hides them from automation; force them open.
+# closed, which hides them from automation; force them open. The flag lets
+# diagnostics confirm the pre-load injection actually ran.
 _FORCE_OPEN_SHADOW_JS = """
 (function () {
+  window.__arbShadowPatched = true;
   const original = Element.prototype.attachShadow;
   Element.prototype.attachShadow = function (init) {
     const opened = Object.assign({}, init || {}, { mode: 'open' });
@@ -125,18 +127,24 @@ if (start.shadowRoot) collect(start.shadowRoot);
 return out;
 """
 
-# One-shot page statistics for --dump-bet365: selector hit counts, class
-# token frequencies and clickable texts, all shadow-DOM aware.
+# One-shot page probe for --dump-bet365. Walks the light DOM and every
+# open shadow root, and reports: whether our attachShadow patch ran, total
+# element and shadow-host counts, SELECTORS hit counts, the most frequent
+# class names (UNFILTERED, minus obvious betslip noise), and — most useful
+# for rebuilding selectors — the class-chain of whichever element contains
+# each requested anchor text (e.g. "WK 2026").
 _DUMP_STATS_JS = """
 const selectors = arguments[0];
-const classRegex = /Coupon|Market|Particip|Fixture|Label|Link|Button|Header|Odds|Classification|Splash|Menu|Nav|Team|Event/;
+const anchors = arguments[1];
+
 const roots = [];
+let elementCount = 0;
 function collectRoots(root) {
   if (!root.querySelectorAll) return;
   roots.push(root);
-  for (const el of root.querySelectorAll('*')) {
-    if (el.shadowRoot) collectRoots(el.shadowRoot);
-  }
+  const all = root.querySelectorAll('*');
+  elementCount += all.length;
+  for (const el of all) if (el.shadowRoot) collectRoots(el.shadowRoot);
 }
 collectRoots(document);
 
@@ -148,28 +156,60 @@ for (const [name, css] of Object.entries(selectors)) {
 }
 
 const classes = {};
-const texts = [];
-const seen = new Set();
 for (const root of roots) {
   for (const el of root.querySelectorAll('*')) {
-    if (el.classList) {
-      for (const token of el.classList) {
-        if (classRegex.test(token)) classes[token] = (classes[token] || 0) + 1;
-      }
-    }
-  }
-  for (const el of root.querySelectorAll(
-    "a, [class*='Link'], [class*='Button'], [class*='Label']"
-  )) {
-    const text = (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 60);
-    if (text && !seen.has(text) && seen.size < 40) {
-      seen.add(text);
-      texts.push(text);
+    if (!el.classList) continue;
+    for (const token of el.classList) {
+      if (/^(bs|bss|bsf|bsk|bf)-/.test(token)) continue;  // betslip noise
+      classes[token] = (classes[token] || 0) + 1;
     }
   }
 }
-return { shadowRoots: roots.length - 1, hits: hits, classes: classes, texts: texts };
+
+function classChain(el) {
+  const chain = [];
+  let node = el;
+  for (let i = 0; node && i < 8; i++) {
+    const cls = (node.className && node.className.baseVal !== undefined)
+      ? node.className.baseVal : (node.className || '');
+    chain.push(node.tagName.toLowerCase() + (cls ? '.' + String(cls).trim().split(/\\s+/).join('.') : ''));
+    node = node.parentElement || (node.getRootNode() && node.getRootNode().host);
+  }
+  return chain;
+}
+
+const anchorHits = {};
+for (const anchor of anchors) {
+  for (const root of roots) {
+    let found = null;
+    for (const el of root.querySelectorAll('*')) {
+      if (el.children.length === 0 && (el.textContent || '').trim() === anchor) {
+        found = el; break;
+      }
+    }
+    if (!found) {  // fall back to a contains match on a leaf-ish node
+      for (const el of root.querySelectorAll('*')) {
+        if (el.children.length <= 1 && (el.textContent || '').includes(anchor)) {
+          found = el; break;
+        }
+      }
+    }
+    if (found) { anchorHits[anchor] = classChain(found); break; }
+  }
+}
+
+return {
+  patched: !!window.__arbShadowPatched,
+  elementCount: elementCount,
+  shadowRoots: roots.length - 1,
+  hits: hits,
+  classes: classes,
+  anchors: anchorHits,
+};
 """
+
+# On-screen texts used to locate the sports-content DOM by anchor.
+_DUMP_ANCHORS = ["WK 2026", "Frankrijk v Marokko", "Alle sporten", "Aankomend", "Live"]
 
 
 def fractional_to_decimal(odds_text: str) -> float | None:
@@ -548,19 +588,26 @@ class SeleniumBet365Provider(OddsProvider):
         )
         print(f"body text: {body_text!r}")
 
-        stats = driver.execute_script(_DUMP_STATS_JS, SELECTORS)
+        stats = driver.execute_script(_DUMP_STATS_JS, SELECTORS, _DUMP_ANCHORS)
+        print(f"attachShadow patch ran: {stats['patched']}")
+        print(f"elements reachable: {stats['elementCount']}")
         print(f"open shadow roots: {stats['shadowRoots']}")
         matched = {name: count for name, count in stats["hits"].items() if count}
         print(f"SELECTORS hits: {matched if matched else 'none'}")
 
-        print("frequent classes:")
-        ranked = sorted(stats["classes"].items(), key=lambda kv: -kv[1])
-        for token, count in ranked[:50]:
-            print(f"{count:>5}  {token}")
+        print("anchor text -> class chain (element containing known on-screen text):")
+        if stats["anchors"]:
+            for anchor, chain in stats["anchors"].items():
+                print(f"  [{anchor}]")
+                for step in chain:
+                    print(f"      {step}")
+        else:
+            print("  (none of the anchor texts were found in the queried DOM)")
 
-        print("sample clickable texts:")
-        for text in stats["texts"]:
-            print(f"  {text}")
+        print("frequent classes (unfiltered, betslip noise removed):")
+        ranked = sorted(stats["classes"].items(), key=lambda kv: -kv[1])
+        for token, count in ranked[:60]:
+            print(f"{count:>5}  {token}")
 
     # ------------------------------------------------------------------ #
     # Helpers
