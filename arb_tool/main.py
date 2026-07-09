@@ -34,6 +34,13 @@ def scan_once(config: Config, notifier: DiscordNotifier, seen: set) -> list[Arbi
 
     pairs = match_props(bet365_props, unibet_props)
     log.info("Matched %d player/line pairs across both books", len(pairs))
+    if not pairs and bet365_props and unibet_props:
+        from .matching import diagnose_no_match
+
+        log.warning(
+            "Bet365 %s\n%s", bet365.name,
+            diagnose_no_match(bet365_props, unibet_props, bet365.name, unibet.name),
+        )
 
     arbs = find_arbitrages(pairs, config.total_stake, config.min_profit_pct)
     new_arbs = [arb for arb in arbs if arb.key() not in seen]

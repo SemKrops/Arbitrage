@@ -19,6 +19,19 @@ def arbitrage_margin(over_odds: float, under_odds: float) -> float:
     return 1.0 / over_odds + 1.0 / under_odds
 
 
+def _best_event(*props: PropOdds) -> str:
+    """Pick the most trustworthy event label for display.
+
+    bet365's event name is scraped from the page and can be unreliable, so
+    prefer a non-bet365 book's label (e.g. Unibet's, from its API) when
+    available; fall back to the first prop's event otherwise.
+    """
+    for prop in props:
+        if prop.bookmaker.lower() != "bet365" and prop.event:
+            return prop.event
+    return props[0].event
+
+
 def split_stakes(over_odds: float, under_odds: float, total_stake: float) -> tuple[float, float]:
     """Split ``total_stake`` so both outcomes return the same payout.
 
@@ -55,7 +68,7 @@ def check_pair(
 
     return ArbitrageOpportunity(
         competition=over_prop.competition,
-        event=over_prop.event,
+        event=_best_event(over_prop, under_prop),
         kickoff=over_prop.kickoff or under_prop.kickoff,
         player=over_prop.player,
         market=over_prop.market,

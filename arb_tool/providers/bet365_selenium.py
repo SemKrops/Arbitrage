@@ -269,7 +269,9 @@ for (const root of roots) {
 return pods;
 """
 
-# Find the match's "Team v Team" name in the main content.
+# Find the match's "Team v Team" name in the MAIN content — not bet365's
+# left-nav sidebar, whose obfuscated lhs-/sln-/hrm- containers also list
+# other ("trending") fixtures and would otherwise be picked up.
 _EVENT_NAME_JS = r"""
 const roots = [];
 function collectRoots(root) {
@@ -278,23 +280,38 @@ function collectRoots(root) {
   for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collectRoots(el.shadowRoot);
 }
 collectRoots(document);
+
 const re = /^[A-Z][\w .'À-ɏ-]{1,28} v [A-Z][\w .'À-ɏ-]{1,28}$/;
-for (const sel of ['.sph-EventHeader_Label', '.sph-FixtureDetailsTwoWay_Team',
-                   '[class*="EventHeader"]', '[class*="FixtureName"]']) {
+
+function inChrome(el) {
+  // True if el is inside the left-nav / header chrome (obfuscated prefixes).
+  let n = el;
+  for (let i = 0; i < 14 && n; i++) {
+    const c = (n.className && n.className.baseVal !== undefined)
+      ? n.className.baseVal : (n.className || '');
+    if (/(^|\s)(lhs|sln|hrm|wc|wn|hl|nav)-/.test(String(c))) return true;
+    n = n.parentElement || (n.getRootNode && n.getRootNode().host);
+  }
+  return false;
+}
+
+// Prefer explicit event-header selectors in the main content.
+for (const sel of ['.sph-EventHeader_Label', '[class*="EventHeader"]',
+                   '[class*="FixtureName"]', '[class*="ParticipantHeader"]']) {
   for (const root of roots) {
     for (const el of root.querySelectorAll(sel)) {
       const t = (el.innerText || '').trim();
-      if (re.test(t)) return t;
+      if (re.test(t) && !inChrome(el)) return t;
     }
   }
 }
-// Fallback: shortest element text matching "X v Y".
+// Fallback: shortest "X v Y" text that is NOT in the nav/header chrome.
 let best = null;
 for (const root of roots) {
   for (const el of root.querySelectorAll('div, span, h1, h2')) {
     if (el.children.length > 2) continue;
     const t = (el.innerText || '').trim();
-    if (re.test(t) && (best === null || t.length < best.length)) best = t;
+    if (re.test(t) && !inChrome(el) && (best === null || t.length < best.length)) best = t;
   }
 }
 return best;

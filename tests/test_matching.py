@@ -50,3 +50,17 @@ def test_match_props_ignores_other_competitions_and_players():
         prop("Unibet", "Liverpool - Arsenal", "Bukayo Saka"),
     ]
     assert match_props(a, b) == []
+
+
+def test_match_props_does_not_require_event_match():
+    # bet365's event label may be wrong/missing; player+market+line is enough.
+    a = [prop("Bet365", "Wrong Fixture Name", "Mohamed Salah")]
+    b = [prop("Unibet", "Liverpool - Arsenal", "Salah, Mohamed")]
+    assert len(match_props(a, b)) == 1
+
+
+def test_match_props_rejects_conflicting_real_fixtures():
+    # Two same-named players in clearly different, parseable fixtures: skip.
+    a = [prop("Bet365", "Everton vs Fulham", "John Smith")]
+    b = [prop("Unibet", "Liverpool - Arsenal", "John Smith")]
+    assert match_props(a, b) == []

@@ -117,7 +117,14 @@ def players_match(player_a: str, player_b: str) -> bool:
 def match_props(
     props_a: list[PropOdds], props_b: list[PropOdds]
 ) -> list[tuple[PropOdds, PropOdds]]:
-    """Pair up props that refer to the same player/market/line at both books."""
+    """Pair up props for the same player/market/line at both books.
+
+    The key is (competition, market, line, player). Event name is NOT
+    required to match: a player appears in only one game per matchday, so
+    player+market+line already identifies the fixture, and one book's event
+    label (e.g. bet365's scraped header) can be unreliable. When both events
+    are known and clearly different, though, the pair is rejected as a guard.
+    """
     pairs: list[tuple[PropOdds, PropOdds]] = []
     # Bucket by (competition, market, line) first so fuzzy matching only runs
     # on plausible candidates.
@@ -127,8 +134,57 @@ def match_props(
 
     for prop_a in props_a:
         for prop_b in buckets.get((prop_a.competition, prop_a.market, prop_a.line), []):
-            if events_match(prop_a.event, prop_b.event) and players_match(
-                prop_a.player, prop_b.player
-            ):
-                pairs.append((prop_a, prop_b))
+            if not players_match(prop_a.player, prop_b.player):
+                continue
+            # If both events are meaningful and clearly disagree, skip — this
+            # protects against two same-named players in different games.
+            if _events_conflict(prop_a.event, prop_b.event):
+                continue
+            pairs.append((prop_a, prop_b))
     return pairs
+
+
+def _events_conflict(event_a: str, event_b: str) -> bool:
+    """True only when both events look like real fixtures yet don't match."""
+    if not _event_teams(event_a) or not _event_teams(event_b):
+        return False  # at least one is unparseable/unknown — don't block
+    return not events_match(event_a, event_b)
+
+
+def summarize_props(props: list[PropOdds]) -> dict:
+    """Compact stats for diagnosing why nothing matched."""
+    lines_by_market: dict[str, set] = {}
+    players: set = set()
+    events: set = set()
+    for prop in props:
+        lines_by_market.setdefault(prop.market.value, set()).add(prop.line)
+        players.add(normalize_player(prop.player))
+        events.add(prop.event)
+    return {
+        "count": len(props),
+        "lines_by_market": {m: sorted(v) for m, v in lines_by_market.items()},
+        "players": players,
+        "events": sorted(events)[:8],
+    }
+
+
+def diagnose_no_match(props_a, props_b, name_a: str, name_b: str) -> str:
+    """Human-readable explanation of why two prop sets produced no pairs."""
+    a, b = summarize_props(props_a), summarize_props(props_b)
+    common_players = sorted(a["players"] & b["players"])[:10]
+    lines: list[str] = []
+    for market in sorted(set(a["lines_by_market"]) | set(b["lines_by_market"])):
+        la = a["lines_by_market"].get(market, [])
+        lb = b["lines_by_market"].get(market, [])
+        overlap = sorted(set(la) & set(lb))
+        lines.append(
+            f"    {market}: {name_a} lines={la or '-'}, {name_b} lines={lb or '-'}, "
+            f"overlap={overlap or 'NONE'}"
+        )
+    return (
+        f"No pairs matched.\n"
+        f"  {name_a}: {a['count']} props, events={a['events']}\n"
+        f"  {name_b}: {b['count']} props, events={b['events']}\n"
+        f"  players in common (normalized): {common_players or 'NONE'}\n"
+        f"  market/line overlap:\n" + "\n".join(lines)
+    )
