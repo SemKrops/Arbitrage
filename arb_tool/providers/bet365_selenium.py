@@ -78,14 +78,16 @@ SELECTORS = {
     "cell_odds": ".gl-ParticipantCenteredStacked_Odds",
 }
 
-# Market group titles as bet365 names them, English and Dutch.
-MARKET_TITLES = {
-    Market.SHOTS: ("player shots", "spelersschoten", "schoten van speler"),
-    Market.SHOTS_ON_TARGET: (
-        "player shots on target",
-        "spelersschoten op doel",
-        "schoten op doel van speler",
-    ),
+# Milestone-grid market titles (English + Dutch) mapped to our markets. The
+# match is exact on the pod title so nearby variants ("... Over/Under",
+# "Headed ...", "... Outside Box") are excluded.
+MILESTONE_MARKET_TITLES = {
+    "player shots": Market.SHOTS,
+    "speler schoten": Market.SHOTS,
+    "spelersschoten": Market.SHOTS,
+    "player shots on target": Market.SHOTS_ON_TARGET,
+    "speler schoten op doel": Market.SHOTS_ON_TARGET,
+    "spelersschoten op doel": Market.SHOTS_ON_TARGET,
 }
 
 # Link texts used to find each competition from the football section.
@@ -210,6 +212,93 @@ return {
 
 # On-screen texts used to locate the sports-content DOM by anchor.
 _DUMP_ANCHORS = ["WK 2026", "Frankrijk v Marokko", "Alle sporten", "Aankomend", "Live"]
+
+# Extract the shots milestone grids into structured rows. Each shots pod is
+# a set of columns: one player column (.srb-ParticipantLabelWithTeam_Name)
+# and one column per "N+" milestone. Every milestone column holds exactly
+# one .gl-ParticipantOddsOnly cell per player (suspended cells included, with
+# empty odds), so cell i aligns to player i. Returns, per pod:
+#   { title, players: [name], columns: [ { header: "2+", odds: [".."] } ] }
+# with odds[i] the price for players[i] ("" when suspended/absent).
+_SHOTS_PROPS_JS = r"""
+const roots = [];
+function collectRoots(root) {
+  if (!root.querySelectorAll) return;
+  roots.push(root);
+  for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collectRoots(el.shadowRoot);
+}
+collectRoots(document);
+
+function txt(el) { return el ? (el.innerText || el.textContent || '').trim() : ''; }
+
+function headerOf(col) {
+  // The milestone label, e.g. "2+". Scan descendants for the first N+ token.
+  for (const el of col.querySelectorAll('*')) {
+    const t = txt(el);
+    if (/^\d+\+$/.test(t)) return t;
+  }
+  const first = (txt(col).split('\n')[0] || '').trim();
+  return /^\d+\+$/.test(first) ? first : '';
+}
+
+const pods = [];
+for (const root of roots) {
+  for (const pod of root.querySelectorAll('.gl-MarketGroupPod')) {
+    const title = txt(pod.querySelector(
+      '.cm-MarketGroupWithIconsButton_Text, .srb-ButtonWithBetBuilderIcon_Text'
+    ));
+    const players = Array.from(pod.querySelectorAll('.srb-ParticipantLabelWithTeam_Name'))
+      .map(txt).filter(t => t);
+    if (!players.length) continue;
+
+    const columns = [];
+    for (const col of pod.querySelectorAll('.gl-Market')) {
+      if (col.querySelector('.srb-ParticipantLabelWithTeam_Name')) continue;  // player col
+      const cells = col.querySelectorAll('.gl-ParticipantOddsOnly');
+      if (!cells.length) continue;
+      const header = headerOf(col);
+      if (!header) continue;
+      const odds = Array.from(cells).map(
+        c => txt(c.querySelector('.gl-ParticipantOddsOnly_Odds'))
+      );
+      columns.push({ header: header, odds: odds });
+    }
+    if (columns.length) pods.push({ title: title, players: players, columns: columns });
+  }
+}
+return pods;
+"""
+
+# Find the match's "Team v Team" name in the main content.
+_EVENT_NAME_JS = r"""
+const roots = [];
+function collectRoots(root) {
+  if (!root.querySelectorAll) return;
+  roots.push(root);
+  for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collectRoots(el.shadowRoot);
+}
+collectRoots(document);
+const re = /^[A-Z][\w .'À-ɏ-]{1,28} v [A-Z][\w .'À-ɏ-]{1,28}$/;
+for (const sel of ['.sph-EventHeader_Label', '.sph-FixtureDetailsTwoWay_Team',
+                   '[class*="EventHeader"]', '[class*="FixtureName"]']) {
+  for (const root of roots) {
+    for (const el of root.querySelectorAll(sel)) {
+      const t = (el.innerText || '').trim();
+      if (re.test(t)) return t;
+    }
+  }
+}
+// Fallback: shortest element text matching "X v Y".
+let best = null;
+for (const root of roots) {
+  for (const el of root.querySelectorAll('div, span, h1, h2')) {
+    if (el.children.length > 2) continue;
+    const t = (el.innerText || '').trim();
+    if (re.test(t) && (best === null || t.length < best.length)) best = t;
+  }
+}
+return best;
+"""
 
 # Targeted odds extractor: for each shots market pod, pull the title, player
 # names, column headers (the lines) and the actual odds cells — both the
@@ -384,6 +473,13 @@ class SeleniumBet365Provider(OddsProvider):
         self.competition_urls = {
             comp: os.environ.get(f"BET365_URL_{comp.name}", "") for comp in Competition
         }
+        # Explicit match pages to scrape, mapped to their competition. bet365's
+        # left-nav classes are obfuscated and its match URLs are session-bound,
+        # so the reliable way to point the scraper at games is to list their
+        # URLs. Configure with BET365_MATCH_URLS as competition=url pairs,
+        # comma/newline separated, e.g.:
+        #   BET365_MATCH_URLS=world_cup=https://www.bet365.nl/#/AC/.../
+        self.match_urls = _parse_match_urls(os.environ.get("BET365_MATCH_URLS", ""))
 
     # ------------------------------------------------------------------ #
     # Browser setup
@@ -497,175 +593,118 @@ class SeleniumBet365Provider(OddsProvider):
 
     def _scrape(self, driver, competitions: tuple[Competition, ...]) -> list[PropOdds]:
         props: list[PropOdds] = []
-        for competition in competitions:
+        targets = [
+            (comp, url) for comp, url in self.match_urls if comp in competitions
+        ]
+        if not targets:
+            log.warning(
+                "Bet365: no match URLs configured for the requested "
+                "competitions. Set BET365_MATCH_URLS (e.g. "
+                "world_cup=https://www.bet365.nl/#/AC/...) to the match pages "
+                "you want scraped. See --dump-bet365 to grab a match URL."
+            )
+            return props
+
+        for competition, url in targets:
             try:
-                if not self._open_competition(driver, competition):
-                    continue
-                event_urls = self._collect_event_urls(driver)
+                driver.get(url)
+                self._open_shots_tab(driver)
+                event_name = self._read_event_name(driver)
+                found = self._parse_match_page(driver, competition, event_name)
                 log.info(
-                    "Bet365: %s — found %d match pages", competition.value, len(event_urls)
+                    "Bet365: %s (%s) — %d shots props",
+                    event_name, competition.value, len(found),
                 )
-                for url in event_urls[: self.max_events]:
-                    driver.get(url)
-                    self._wait_for(driver, SELECTORS["market_group"])
-                    props.extend(self._parse_match_page(driver, competition))
+                props.extend(found)
             except Exception as exc:
                 log.warning(
                     "Bet365: scraping %s failed (%s). Page title was %r — a "
                     "block/challenge page usually means your IP or headless "
-                    "browser was detected.",
-                    competition.value, exc, _safe_title(driver),
+                    "browser was detected; run --dump-bet365 to inspect.",
+                    url, exc, _safe_title(driver),
                 )
         return props
 
-    def _open_competition(self, driver, competition: Competition) -> bool:
-        """Land on the competition's fixtures page; True on success."""
-        deep_link = self.competition_urls[competition]
-        if deep_link:
-            driver.get(deep_link)
-            return self._wait_for(driver, SELECTORS["event_row"])
-
-        driver.get(f"{self.base_url}/#/AS/B1/")  # football section
-        self._dismiss_cookies(driver)
-        if not self._wait_for(driver, SELECTORS["competition_link"]):
-            log.warning(
-                "Bet365: football section did not load (title %r) — the DOM "
-                "may have changed (run --dump-bet365) or you may be blocked; "
-                "try BET365_HEADLESS=0 or set BET365_URL_%s to a direct link.",
-                _safe_title(driver), competition.name,
-            )
-            return False
-
-        wanted = COMPETITION_LINKS[competition]
-        for link in self._query(driver, SELECTORS["competition_link"]):
-            text = self._text(driver, link).lower()
-            if any(w in text for w in wanted):
-                self._click(driver, link)
-                return self._wait_for(driver, SELECTORS["event_row"])
-        log.warning("Bet365: no %s link found in football section", competition.value)
-        return False
-
-    def _collect_event_urls(self, driver) -> list[str]:
-        """Open each listed match once to record its (session-bound) URL."""
-        urls: list[str] = []
-        count = len(self._query(driver, SELECTORS["event_row"]))
-        list_url = driver.current_url
-        for index in range(min(count, self.max_events)):
-            rows = self._query(driver, SELECTORS["event_row"])
-            if index >= len(rows):
+    def _open_shots_tab(self, driver) -> None:
+        """Click the match page's 'Shots' market-group tab and let it render."""
+        self._wait_for(driver, ".sph-MarketGroupNavBarButton, .gl-MarketGroupPod")
+        for button in self._query(driver, ".sph-MarketGroupNavBarButton_Content"):
+            label = self._text(driver, button).lower()
+            if label in ("shots", "schoten"):
+                self._click(driver, button)
                 break
-            self._click(driver, rows[index])
-            if self._wait_for(driver, SELECTORS["market_group"]):
-                urls.append(driver.current_url)
-            driver.get(list_url)
-            self._wait_for(driver, SELECTORS["event_row"])
-        return urls
+        self._wait_for(driver, ".gl-MarketGroupPod")
+        # Scroll the shots pods into view so bet365 renders their odds cells.
+        try:
+            driver.execute_script(_EXPAND_SHOTS_JS)
+        except Exception:  # pragma: no cover - best effort
+            pass
+        time.sleep(2)
 
     # ------------------------------------------------------------------ #
     # Parsing
     # ------------------------------------------------------------------ #
 
-    def _parse_match_page(self, driver, competition: Competition) -> list[PropOdds]:
-        event_name = self._read_event_name(driver)
+    def _parse_match_page(
+        self, driver, competition: Competition, event_name: str
+    ) -> list[PropOdds]:
+        """Parse the shots milestone grids into Over-side PropOdds.
+
+        bet365 lists player props as "N+ shots" milestone columns (N or more
+        = Over (N-0.5)), giving only the Over side; that still arbs against
+        Unibet's Under at the same line.
+        """
+        pods = driver.execute_script(_SHOTS_PROPS_JS)
         props: list[PropOdds] = []
-        for group in self._query(driver, SELECTORS["market_group"]):
-            market = self._classify_group(driver, group)
+        for pod in pods:
+            market = MILESTONE_MARKET_TITLES.get((pod.get("title") or "").strip().lower())
             if market is None:
-                continue
-            self._expand_group(driver, group)
-            props.extend(
-                self._parse_market_group(driver, group, competition, event_name, market)
-            )
+                continue  # not a plain shots milestone grid (e.g. Over/Under, Headed)
+            props.extend(self._pod_to_props(pod, competition, event_name, market))
         if not props:
-            log.debug("Bet365: no player shots markets on %r", event_name)
+            log.debug("Bet365: no shots milestone markets parsed on %r", event_name)
         return props
 
-    def _classify_group(self, driver, group) -> Market | None:
-        titles = self._query(driver, SELECTORS["market_group_title"], group)
-        title = self._text(driver, titles[0]).lower() if titles else ""
-        for market, names in MARKET_TITLES.items():
-            if title in names:
-                return market
-        return None
-
-    def _expand_group(self, driver, group) -> None:
-        """Open a collapsed market group and click 'Show more' if present."""
-        is_open = driver.execute_script(
-            "return arguments[0].matches(arguments[1])", group, SELECTORS["market_group_open"]
-        )
-        if not is_open:
-            headers = self._query(driver, SELECTORS["market_group_title"], group)
-            if headers:
-                self._click(driver, headers[0])
-                time.sleep(0.5)
-        for more in self._query(driver, SELECTORS["show_more"], group):
-            self._click(driver, more)
-            time.sleep(0.3)
-
-    def _parse_market_group(
-        self, driver, group, competition: Competition, event_name: str, market: Market
+    def _pod_to_props(
+        self, pod: dict, competition: Competition, event_name: str, market: Market
     ) -> list[PropOdds]:
-        """Parse bet365's player-props grid.
-
-        Layout: a label column with player names, then one column per side
-        ("Over"/"Under"), each cell stacking the line above the odds.
-        """
-        players = [
-            text
-            for el in self._query(driver, SELECTORS["player_name"], group)
-            if (text := self._text(driver, el))
-        ]
-        if not players:
-            return []
-
-        sides: dict[str, list[tuple[float | None, float | None]]] = {}
-        for column in self._query(driver, SELECTORS["column"], group):
-            headers = self._query(driver, SELECTORS["column_header"], column)
-            header = self._text(driver, headers[0]).lower() if headers else ""
-            if header in ("over", "meer dan"):
-                side = "over"
-            elif header in ("under", "minder dan"):
-                side = "under"
-            else:
-                continue
-            cells = []
-            for cell in self._query(driver, SELECTORS["cell_stacked"], column):
-                line = self._read_text(driver, cell, SELECTORS["cell_handicap"])
-                odds = self._read_text(driver, cell, SELECTORS["cell_odds"])
-                cells.append((_parse_line(line), fractional_to_decimal(odds)))
-            sides[side] = cells
-
+        players = pod["players"]
+        # player -> best (lowest-line) Over we have, so we emit one prop per
+        # (player, line); keep every line since Unibet may match any of them.
         props: list[PropOdds] = []
-        for index, player in enumerate(players):
-            over_line, over_odds = _cell_at(sides.get("over"), index)
-            under_line, under_odds = _cell_at(sides.get("under"), index)
-            line = over_line if over_line is not None else under_line
-            if line is None or (over_odds is None and under_odds is None):
+        for column in pod["columns"]:
+            milestone = _milestone_to_int(column["header"])
+            if milestone is None:
                 continue
-            if under_line is not None and over_line is not None and under_line != over_line:
-                continue  # asymmetric lines: not a two-way arb candidate
-            props.append(
-                PropOdds(
-                    bookmaker=self.name,
-                    competition=competition,
-                    event=event_name,
-                    kickoff=None,
-                    player=player,
-                    market=market,
-                    line=line,
-                    over=over_odds,
-                    under=under_odds,
+            line = milestone - 0.5  # "N+" == Over (N-0.5)
+            for index, odds_text in enumerate(column["odds"]):
+                if index >= len(players):
+                    break
+                over = fractional_to_decimal(odds_text)
+                if over is None:
+                    continue  # suspended / no price for this player at this line
+                props.append(
+                    PropOdds(
+                        bookmaker=self.name,
+                        competition=competition,
+                        event=event_name,
+                        kickoff=None,
+                        player=players[index],
+                        market=market,
+                        line=line,
+                        over=over,
+                        under=None,
+                    )
                 )
-            )
         return props
 
     def _read_event_name(self, driver) -> str:
-        for selector in (".sph-EventHeader_Label", ".sip-EventHeader_Label", "h1"):
-            elements = self._query(driver, selector)
-            if elements:
-                text = self._text(driver, elements[0])
-                if text:
-                    return text.replace(" v ", " vs ")
+        try:
+            name = driver.execute_script(_EVENT_NAME_JS)
+        except Exception:
+            name = None
+        if name:
+            return name.replace(" v ", " vs ")
         return driver.title
 
     # ------------------------------------------------------------------ #
@@ -879,6 +918,31 @@ class SeleniumBet365Provider(OddsProvider):
 def _parse_line(text: str) -> float | None:
     match = re.search(r"\d+(?:[.,]\d+)?", text)
     return float(match.group().replace(",", ".")) if match else None
+
+
+def _milestone_to_int(header: str) -> int | None:
+    """"3+" -> 3."""
+    match = re.match(r"(\d+)\+", header.strip())
+    return int(match.group(1)) if match else None
+
+
+def _parse_match_urls(raw: str) -> list[tuple[Competition, str]]:
+    """Parse BET365_MATCH_URLS: "competition=url" pairs, comma/newline split."""
+    result: list[tuple[Competition, str]] = []
+    for chunk in re.split(r"[,\n]", raw):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        comp_key, _, url = chunk.partition("=")
+        comp_key = comp_key.strip().lower().replace(" ", "_")
+        if comp_key == "laliga":
+            comp_key = "la_liga"
+        url = url.strip()
+        try:
+            result.append((Competition(comp_key), url))
+        except ValueError:
+            log.warning("Bet365: unknown competition %r in BET365_MATCH_URLS", comp_key)
+    return result
 
 
 def _cell_at(cells, index: int) -> tuple[float | None, float | None]:

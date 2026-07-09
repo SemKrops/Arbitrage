@@ -1,70 +1,66 @@
 <!DOCTYPE html>
 <html>
-<!-- Minimal replica of bet365's player-props DOM used to test the
-     Selenium parser without touching the real site. -->
-<head><title>Liverpool v Arsenal - Bet365</title></head>
+<!-- Replica of bet365's match-page shots milestone grids, matching the
+     structure confirmed from the live site: a player column plus one
+     "N+" milestone column each, one odds cell per player (suspended cells
+     have no odds), where "N+" == Over (N-0.5). Used to test the parser
+     without touching the real site. -->
+<head><title>bet365</title></head>
 <body>
   <div class="sph-EventHeader_Label">Liverpool v Arsenal</div>
 
-  <div class="gl-MarketGroup gl-MarketGroup_Open">
-    <div class="gl-MarketGroupButton_Text">Player Shots</div>
-    <div class="gl-Market">
-      <div class="srb-ParticipantLabelWithTeam_Name">Mohamed Salah</div>
-      <div class="srb-ParticipantLabelWithTeam_Name">Bukayo Saka</div>
-    </div>
-    <div class="gl-Market">
-      <div class="gl-MarketColumnHeader">Over</div>
-      <div class="gl-ParticipantCenteredStacked">
-        <span class="gl-ParticipantCenteredStacked_Handicap">2.5</span>
-        <span class="gl-ParticipantCenteredStacked_Odds">2.10</span>
+  <!-- Player Shots: columns 1+, 2+, 3+ -->
+  <div class="gl-MarketGroupPod srb-HScrollFixtureSubGroupWithShowMore">
+    <div class="srb-ButtonWithBetBuilderIcon_Text">Player Shots</div>
+    <div class="gl-MarketGroupContainer">
+      <div class="srb-HScrollParticipantMarket gl-Market gl-Market_General">
+        <div class="srb-HScrollParticipantHeader">Player / Last 5</div>
+        <div class="srb-ParticipantLabelWithTeam"><div class="srb-ParticipantLabelWithTeam_Name">Mohamed Salah</div></div>
+        <div class="srb-ParticipantLabelWithTeam"><div class="srb-ParticipantLabelWithTeam_Name">Bukayo Saka</div></div>
       </div>
-      <div class="gl-ParticipantCenteredStacked">
-        <span class="gl-ParticipantCenteredStacked_Handicap">1.5</span>
-        <span class="gl-ParticipantCenteredStacked_Odds">8/5</span>
+      <div class="gl-Market gl-Market_General gl-Market_General-columnheader">
+        <div class="gl-MarketColumnHeader">1+</div>
+        <div class="gl-ParticipantOddsOnly"><span class="gl-ParticipantOddsOnly_Odds">1.20</span></div>
+        <div class="gl-ParticipantOddsOnly"><span class="gl-ParticipantOddsOnly_Odds">1.30</span></div>
       </div>
-    </div>
-    <div class="gl-Market">
-      <div class="gl-MarketColumnHeader">Under</div>
-      <div class="gl-ParticipantCenteredStacked">
-        <span class="gl-ParticipantCenteredStacked_Handicap">2.5</span>
-        <span class="gl-ParticipantCenteredStacked_Odds">1.72</span>
+      <div class="gl-Market gl-Market_General gl-Market_General-columnheader">
+        <div class="gl-MarketColumnHeader">2+</div>
+        <div class="gl-ParticipantOddsOnly"><span class="gl-ParticipantOddsOnly_Odds">2.10</span></div>
+        <div class="gl-ParticipantOddsOnly"><span class="gl-ParticipantOddsOnly_Odds">2.50</span></div>
       </div>
-      <div class="gl-ParticipantCenteredStacked">
-        <span class="gl-ParticipantCenteredStacked_Handicap">1.5</span>
-        <span class="gl-ParticipantCenteredStacked_Odds">2.25</span>
+      <div class="gl-Market gl-Market_General gl-Market_General-columnheader">
+        <div class="gl-MarketColumnHeader">3+</div>
+        <div class="gl-ParticipantOddsOnly"><span class="gl-ParticipantOddsOnly_Odds">4.00</span></div>
+        <!-- Saka suspended at 3+: no odds -->
+        <div class="gl-ParticipantOddsOnly gl-ParticipantOddsOnly_Suspended"></div>
       </div>
     </div>
   </div>
 
-  <div class="gl-MarketGroup gl-MarketGroup_Open">
-    <div class="gl-MarketGroupButton_Text">Player Shots on Target</div>
-    <div class="gl-Market">
-      <div class="srb-ParticipantLabelWithTeam_Name">Mohamed Salah</div>
-    </div>
-    <div class="gl-Market">
-      <div class="gl-MarketColumnHeader">Over</div>
-      <div class="gl-ParticipantCenteredStacked">
-        <span class="gl-ParticipantCenteredStacked_Handicap">1.5</span>
-        <span class="gl-ParticipantCenteredStacked_Odds">1.85</span>
+  <!-- Player Shots On Target: column 1+ -->
+  <div class="gl-MarketGroupPod srb-HScrollFixtureSubGroupWithShowMore">
+    <div class="srb-ButtonWithBetBuilderIcon_Text">Player Shots On Target</div>
+    <div class="gl-MarketGroupContainer">
+      <div class="srb-HScrollParticipantMarket gl-Market gl-Market_General">
+        <div class="srb-ParticipantLabelWithTeam"><div class="srb-ParticipantLabelWithTeam_Name">Mohamed Salah</div></div>
       </div>
-    </div>
-    <div class="gl-Market">
-      <div class="gl-MarketColumnHeader">Under</div>
-      <div class="gl-ParticipantCenteredStacked">
-        <span class="gl-ParticipantCenteredStacked_Handicap">1.5</span>
-        <span class="gl-ParticipantCenteredStacked_Odds">1.95</span>
+      <div class="gl-Market gl-Market_General gl-Market_General-columnheader">
+        <div class="gl-MarketColumnHeader">1+</div>
+        <div class="gl-ParticipantOddsOnly"><span class="gl-ParticipantOddsOnly_Odds">1.85</span></div>
       </div>
     </div>
   </div>
 
-  <!-- A market group the scraper must ignore -->
-  <div class="gl-MarketGroup gl-MarketGroup_Open">
-    <div class="gl-MarketGroupButton_Text">Goals Over/Under</div>
-    <div class="gl-Market">
-      <div class="gl-MarketColumnHeader">Over</div>
-      <div class="gl-ParticipantCenteredStacked">
-        <span class="gl-ParticipantCenteredStacked_Handicap">2.5</span>
-        <span class="gl-ParticipantCenteredStacked_Odds">1.90</span>
+  <!-- Over/Under and other variants must be ignored (title mismatch). -->
+  <div class="gl-MarketGroupPod gl-MarketGroup">
+    <div class="cm-MarketGroupWithIconsButton_Text">Player Shots Over/Under</div>
+    <div class="gl-MarketGroupContainer">
+      <div class="srb-HScrollParticipantMarket gl-Market">
+        <div class="srb-ParticipantLabelWithTeam"><div class="srb-ParticipantLabelWithTeam_Name">Mohamed Salah</div></div>
+      </div>
+      <div class="gl-Market gl-Market_General">
+        <div class="gl-MarketColumnHeader">2+</div>
+        <div class="gl-ParticipantOddsOnly"><span class="gl-ParticipantOddsOnly_Odds">9.99</span></div>
       </div>
     </div>
   </div>

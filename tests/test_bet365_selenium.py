@@ -59,27 +59,49 @@ def test_deep_query_pierces_closed_shadow_dom(driver):
     assert provider._text(driver, found[0]) == "hidden market"
 
 
+def test_milestone_to_int_and_match_urls():
+    from arb_tool.providers.bet365_selenium import _milestone_to_int, _parse_match_urls
+
+    assert _milestone_to_int("3+") == 3
+    assert _milestone_to_int("10+") == 10
+    assert _milestone_to_int("Over") is None
+
+    urls = _parse_match_urls("world_cup=https://x/1 , la_liga=https://x/2")
+    assert urls == [
+        (Competition.WORLD_CUP, "https://x/1"),
+        (Competition.LA_LIGA, "https://x/2"),
+    ]
+
+
 def test_parse_match_page_from_fixture(driver):
     provider = SeleniumBet365Provider()
     driver.get(FIXTURE.as_uri())
-    props = provider._parse_match_page(driver, Competition.PREMIER_LEAGUE)
+    event_name = provider._read_event_name(driver)
+    props = provider._parse_match_page(driver, Competition.PREMIER_LEAGUE, event_name)
 
-    assert len(props) == 3
-    by_key = {(p.player, p.market): p for p in props}
+    assert event_name == "Liverpool vs Arsenal"
 
-    salah_shots = by_key[("Mohamed Salah", Market.SHOTS)]
-    assert salah_shots.event == "Liverpool vs Arsenal"
-    assert salah_shots.line == 2.5
-    assert salah_shots.over == pytest.approx(2.10)
-    assert salah_shots.under == pytest.approx(1.72)
+    # Player Shots: Salah at 1+/2+/3+ (Over 0.5/1.5/2.5), Saka at 1+/2+
+    # (3+ suspended). Plus Salah Shots on Target 1+ (Over 0.5). = 6 props.
+    # The "Player Shots Over/Under" pod must NOT contribute (9.99 excluded).
+    assert all(p.over != pytest.approx(9.99) for p in props)
+    assert all(p.under is None for p in props)  # milestone grid is Over-only
 
-    saka_shots = by_key[("Bukayo Saka", Market.SHOTS)]
-    assert saka_shots.line == 1.5
-    assert saka_shots.over == pytest.approx(2.60)  # 8/5 fractional
+    by_key = {(p.player, p.market, p.line): p for p in props}
 
-    salah_sot = by_key[("Mohamed Salah", Market.SHOTS_ON_TARGET)]
-    assert salah_sot.market is Market.SHOTS_ON_TARGET
-    assert salah_sot.line == 1.5
+    # "2+" shots == Over 1.5, Salah @ 2.10
+    salah_o15 = by_key[("Mohamed Salah", Market.SHOTS, 1.5)]
+    assert salah_o15.over == pytest.approx(2.10)
+    assert salah_o15.event == "Liverpool vs Arsenal"
 
-    # The "Goals Over/Under" group must not leak in.
-    assert all(p.market in (Market.SHOTS, Market.SHOTS_ON_TARGET) for p in props)
+    # "1+" shots == Over 0.5, Saka @ 1.30
+    assert by_key[("Bukayo Saka", Market.SHOTS, 0.5)].over == pytest.approx(1.30)
+    # "3+" shots == Over 2.5, Salah @ 4.00; Saka suspended -> absent
+    assert by_key[("Mohamed Salah", Market.SHOTS, 2.5)].over == pytest.approx(4.00)
+    assert ("Bukayo Saka", Market.SHOTS, 2.5) not in by_key
+
+    # Shots on target "1+" == Over 0.5, Salah @ 1.85
+    salah_sot = by_key[("Mohamed Salah", Market.SHOTS_ON_TARGET, 0.5)]
+    assert salah_sot.over == pytest.approx(1.85)
+
+    assert len(props) == 6
