@@ -29,6 +29,9 @@ Environment variables:
     BET365_MAX_EVENTS        default 10 matches per competition
     BET365_CHROME_BINARY     optional path to a Chrome/Chromium binary
     BET365_CHROMEDRIVER      optional path to a matching chromedriver
+    BET365_CHROME_VERSION    optional Chrome major version to pin the
+                             undetected-chromedriver download to (normally
+                             auto-detected on mismatch)
     BET365_URL_PREMIER_LEAGUE / BET365_URL_LA_LIGA / BET365_URL_WORLD_CUP
         optional deep links to each competition page; when unset the
         scraper navigates from the football section by link text.
@@ -120,13 +123,40 @@ class SeleniumBet365Provider(OddsProvider):
         """Start Chromium, preferring undetected-chromedriver when installed."""
         try:
             import undetected_chromedriver as uc
-
-            options = uc.ChromeOptions()
-            self._apply_common_options(options)
-            log.info("Bet365: using undetected-chromedriver")
-            return uc.Chrome(options=options, headless=self.headless)
         except ImportError:
-            pass
+            uc = None
+
+        if uc is not None:
+            from selenium.common.exceptions import SessionNotCreatedException
+
+            log.info("Bet365: using undetected-chromedriver")
+            pinned = os.environ.get("BET365_CHROME_VERSION", "")
+            version_main = int(pinned) if pinned else None
+
+            def launch(version):
+                # A ChromeOptions object cannot be reused between attempts.
+                options = uc.ChromeOptions()
+                self._apply_common_options(options)
+                return uc.Chrome(
+                    options=options, headless=self.headless, version_main=version
+                )
+
+            try:
+                return launch(version_main)
+            except SessionNotCreatedException as exc:
+                # uc fetched a driver for the newest Chrome, but the locally
+                # installed browser lags behind ("This version of ChromeDriver
+                # only supports Chrome version 150. Current browser version is
+                # 149..."). Retry pinned to the browser's actual version.
+                detected = re.search(r"[Cc]urrent browser version is (\d+)", str(exc))
+                if detected is None:
+                    raise
+                version = int(detected.group(1))
+                log.info(
+                    "Bet365: chromedriver/browser mismatch, retrying with "
+                    "driver for Chrome %d", version,
+                )
+                return launch(version)
 
         from selenium import webdriver
 
