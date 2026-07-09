@@ -16,12 +16,18 @@ DEFAULT_COMPETITIONS = (
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
-    """Minimal .env loader; existing environment variables win."""
+    """Minimal .env loader; existing environment variables win.
+
+    Reads with ``utf-8-sig`` so a UTF-8 BOM (which Windows PowerShell 5.1
+    writes by default via ``Out-File``/``>``) doesn't get glued onto the
+    first key name.
+    """
     path = Path(path)
     if not path.is_file():
         return
-    for line in path.read_text().splitlines():
-        line = line.strip()
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        # Strip a stray BOM defensively in case one slipped through.
+        line = line.lstrip("﻿").strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
