@@ -68,6 +68,13 @@ def main(argv: list[str] | None = None) -> int:
         "Selenium provider and print selector hit counts, CSS classes and "
         "link texts; saves bet365_dump.html/.png for diagnosing DOM changes",
     )
+    parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="with --dump-bet365: pause after loading so you can navigate the "
+        "browser to a match page, then press Enter to dump it (use with "
+        "BET365_HEADLESS=0)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
 
@@ -81,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.dump_bet365 is not None:
         from .providers.bet365_selenium import SeleniumBet365Provider
 
-        SeleniumBet365Provider().dump_page(args.dump_bet365 or None)
+        SeleniumBet365Provider().dump_page(args.dump_bet365 or None, wait=args.wait)
         return 0
 
     if args.find_competition:

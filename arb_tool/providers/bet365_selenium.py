@@ -211,6 +211,70 @@ return {
 # On-screen texts used to locate the sports-content DOM by anchor.
 _DUMP_ANCHORS = ["WK 2026", "Frankrijk v Marokko", "Alle sporten", "Aankomend", "Live"]
 
+# Market-title substrings whose surrounding subtree we dump on a match page,
+# so the player/line/odds layout can be reverse-engineered despite bet365's
+# obfuscated class names.
+_MARKET_SUBTREE_TERMS = [
+    "Schoten", "schoten", "Shots", "shots", "op doel", "on target",
+]
+
+# For each element whose text contains one of the terms, return a compact
+# representation of its enclosing market subtree: depth, tag, class list and
+# short text for every descendant, so structure and odds cells are visible.
+_MARKET_SUBTREE_JS = """
+const terms = arguments[0];
+const maxNodes = 120;
+
+const roots = [];
+function collectRoots(root) {
+  if (!root.querySelectorAll) return;
+  roots.push(root);
+  for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collectRoots(el.shadowRoot);
+}
+collectRoots(document);
+
+function clsOf(node) {
+  const c = (node.className && node.className.baseVal !== undefined)
+    ? node.className.baseVal : (node.className || '');
+  return String(c).trim();
+}
+
+// Find the smallest element whose own text matches a term, then climb a few
+// levels to a container likely to hold the whole market (players + odds).
+function findMarketContainer(term) {
+  for (const root of roots) {
+    for (const el of root.querySelectorAll('*')) {
+      const own = Array.from(el.childNodes)
+        .filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
+      if (own.includes(term)) {
+        let node = el;
+        for (let i = 0; i < 4 && node.parentElement; i++) node = node.parentElement;
+        return node;
+      }
+    }
+  }
+  return null;
+}
+
+const results = [];
+const seen = new Set();
+for (const term of terms) {
+  const container = findMarketContainer(term);
+  if (!container || seen.has(container)) continue;
+  seen.add(container);
+  const nodes = [];
+  (function walk(node, depth) {
+    if (nodes.length >= maxNodes) return;
+    const text = Array.from(node.childNodes)
+      .filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').trim().slice(0, 40);
+    nodes.push({ depth: depth, tag: node.tagName.toLowerCase(), cls: clsOf(node), text: text });
+    for (const child of node.children) walk(child, depth + 1);
+  })(container, 0);
+  results.push({ term: term, nodeCount: nodes.length, nodes: nodes });
+}
+return results;
+"""
+
 
 def fractional_to_decimal(odds_text: str) -> float | None:
     """Parse bet365 odds shown as decimal ("2.10") or fractional ("11/10")."""
@@ -529,14 +593,22 @@ class SeleniumBet365Provider(OddsProvider):
     # Diagnostics
     # ------------------------------------------------------------------ #
 
-    def dump_page(self, url: str | None = None, out_prefix: str = "bet365_dump") -> None:
+    def dump_page(
+        self, url: str | None = None, out_prefix: str = "bet365_dump", wait: bool = False
+    ) -> None:
         """Open a bet365 page and report what the scraper can see.
 
-        Saves rendered HTML and a screenshot, then prints — for the top
-        document and every iframe, shadow DOM included — per-selector hit
-        counts, frequent CSS classes and sample link texts: everything
-        needed to repair SELECTORS when bet365 changes its DOM.
-        Run via: python -m arb_tool --dump-bet365 [URL]
+        Saves rendered HTML and a screenshot, then prints — shadow DOM and
+        iframes included — the attachShadow-patch status, element/shadow
+        counts, SELECTORS hit counts, anchor-text class chains, unfiltered
+        frequent classes and (on a match page) the market subtree structure.
+
+        With ``wait=True`` (``--dump-bet365 --wait``, best with
+        BET365_HEADLESS=0) it pauses after loading so you can navigate the
+        browser to a match page that has player shots markets open, then
+        dumps whatever is on screen — the reliable way to capture the
+        odds-grid DOM despite bet365's obfuscated class names.
+        Run via: python -m arb_tool --dump-bet365 [URL] [--wait]
         """
         from pathlib import Path
 
@@ -547,6 +619,18 @@ class SeleniumBet365Provider(OddsProvider):
             self._dismiss_cookies(driver)
             time.sleep(2)
 
+            if wait:
+                print(
+                    "\n>>> Browser is open. In the bet365 window, navigate to a "
+                    "match that\n    has Player Shots / Spelersschoten markets "
+                    "open, then press Enter\n    here to dump that page..."
+                )
+                try:
+                    input()
+                except EOFError:
+                    print("(no interactive stdin; dumping current page)")
+                time.sleep(1)
+
             Path(f"{out_prefix}.html").write_text(driver.page_source, encoding="utf-8")
             driver.save_screenshot(f"{out_prefix}.png")
             print(f"Title : {driver.title}")
@@ -554,9 +638,28 @@ class SeleniumBet365Provider(OddsProvider):
             print(f"Saved : {out_prefix}.html, {out_prefix}.png")
 
             self._dump_context(driver, "top document")
+            self._dump_market_subtree(driver)
             self._dump_frames(driver, depth=2)
         finally:
             driver.quit()
+
+    def _dump_market_subtree(self, driver) -> None:
+        """Print the DOM subtree around any player-shots market on the page."""
+        results = driver.execute_script(_MARKET_SUBTREE_JS, _MARKET_SUBTREE_TERMS)
+        if not results:
+            print(
+                "\nmarket subtree: no shots-market text found on this page "
+                "(navigate to a match with player shots open and use --wait)"
+            )
+            return
+        for result in results:
+            print(f"\nmarket subtree for term {result['term']!r} "
+                  f"({result['nodeCount']} nodes):")
+            for node in result["nodes"]:
+                indent = "  " * node["depth"]
+                cls = f".{node['cls'].replace(' ', '.')}" if node["cls"] else ""
+                text = f"  {node['text']!r}" if node["text"] else ""
+                print(f"  {indent}{node['tag']}{cls}{text}")
 
     def _dump_frames(self, driver, depth: int, label: str = "") -> None:
         """Recursively dump every iframe's content."""
