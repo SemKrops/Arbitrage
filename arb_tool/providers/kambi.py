@@ -78,15 +78,44 @@ class KambiUnibetProvider(OddsProvider):
         response.raise_for_status()
         return response.json()
 
+    def _list_view_candidates(self, path: str) -> list[str]:
+        """listView URL variants for a competition path, most likely first.
+
+        Kambi's listView expects the group path padded with "all" to four
+        segments: England's Premier League lives at depth 3
+        (football/england/premier_league → .../all/matches.json) but a
+        World Cup sits directly under football at depth 2 and needs two
+        fillers (football/world_cup_2026/all/all/matches.json).
+        """
+        segments = path.split("/")
+        padded = segments + ["all"] * max(0, 4 - len(segments))
+        candidates = [f"listView/{'/'.join(padded)}/matches.json"]
+        if padded != segments:
+            candidates.append(f"listView/{path}/matches.json")
+        candidates.append(f"listView/{path}.json")
+        return candidates
+
+    def _fetch_listing(self, path: str) -> dict:
+        last_404: requests.HTTPError | None = None
+        for url in self._list_view_candidates(path):
+            try:
+                return self._get(url)
+            except requests.HTTPError as exc:
+                if exc.response is None or exc.response.status_code != 404:
+                    raise
+                last_404 = exc
+        assert last_404 is not None
+        raise last_404
+
     def _list_events(self, competition: Competition) -> list[dict]:
         try:
-            data = self._get(f"listView/{self.paths[competition]}/all/matches.json")
+            data = self._fetch_listing(self.paths[competition])
         except requests.HTTPError as exc:
             if exc.response is None or exc.response.status_code != 404:
                 raise
-            # Path guess is stale (Kambi renames competition term keys, e.g.
-            # for each World Cup edition) — look up the real one in the
-            # group tree and retry.
+            # Path is stale (Kambi renames competition term keys, e.g. for
+            # each World Cup edition) — look up the real one in the group
+            # tree and retry.
             discovered = self._discover_path(competition)
             if not discovered or discovered == self.paths[competition]:
                 raise
@@ -94,7 +123,7 @@ class KambiUnibetProvider(OddsProvider):
                 "Unibet/Kambi: resolved %s to path %r", competition.value, discovered
             )
             self.paths[competition] = discovered
-            data = self._get(f"listView/{discovered}/all/matches.json")
+            data = self._fetch_listing(discovered)
         events = [item["event"] for item in data.get("events", []) if "event" in item]
         if not events:
             log.info(

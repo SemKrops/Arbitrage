@@ -102,6 +102,39 @@ def test_discover_path_la_liga(monkeypatch):
     assert provider._discover_path(Competition.LA_LIGA) == "football/spain/la_liga"
 
 
+def test_list_view_candidates_pads_to_four_segments():
+    provider = KambiUnibetProvider()
+    assert provider._list_view_candidates("football/world_cup_2026") == [
+        "listView/football/world_cup_2026/all/all/matches.json",
+        "listView/football/world_cup_2026/matches.json",
+        "listView/football/world_cup_2026.json",
+    ]
+    # Depth-3 paths (the common case) keep their proven single-"all" form.
+    assert (
+        provider._list_view_candidates("football/england/premier_league")[0]
+        == "listView/football/england/premier_league/all/matches.json"
+    )
+
+
+def test_list_events_uses_padded_url_for_top_level_competition(monkeypatch):
+    """The real-world WK 2026 case: right term key, wrong URL depth."""
+    listing = {
+        "events": [
+            {"event": {"id": 7, "name": "Frankrijk - Nederland", "start": "2026-07-14"}}
+        ]
+    }
+    provider = KambiUnibetProvider()
+
+    def fake_get(path):
+        if path == "listView/football/world_cup_2026/all/all/matches.json":
+            return listing
+        raise http_404()
+
+    monkeypatch.setattr(provider, "_get", fake_get)
+    events = provider._list_events(Competition.WORLD_CUP)
+    assert [e["id"] for e in events] == [7]
+
+
 def test_list_events_falls_back_to_discovery_on_404(monkeypatch):
     listing = {
         "events": [
