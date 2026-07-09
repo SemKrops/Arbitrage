@@ -2,7 +2,18 @@
 
 import os
 
-from arb_tool.config import load_dotenv
+from arb_tool.config import DEFAULT_COMPETITIONS, _parse_competitions, load_dotenv
+from arb_tool.models import Competition
+
+
+def test_parse_competitions():
+    assert _parse_competitions("") == DEFAULT_COMPETITIONS
+    assert _parse_competitions("world_cup") == (Competition.WORLD_CUP,)
+    assert _parse_competitions("premier_league, laliga") == (
+        Competition.PREMIER_LEAGUE,
+        Competition.LA_LIGA,
+    )
+    assert _parse_competitions("La Liga") == (Competition.LA_LIGA,)
 
 
 def test_load_dotenv_handles_utf8_bom(tmp_path, monkeypatch):

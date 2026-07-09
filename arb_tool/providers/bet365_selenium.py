@@ -388,6 +388,70 @@ class SeleniumBet365Provider(OddsProvider):
         return driver.title
 
     # ------------------------------------------------------------------ #
+    # Diagnostics
+    # ------------------------------------------------------------------ #
+
+    def dump_page(self, url: str | None = None, out_prefix: str = "bet365_dump") -> None:
+        """Open a bet365 page and report what the scraper can see.
+
+        Saves the rendered HTML and a screenshot, then prints per-selector
+        hit counts and the CSS class names / link texts present — everything
+        needed to repair the SELECTORS dict when bet365 changes its DOM.
+        Run via: python -m arb_tool --dump-bet365 [URL]
+        """
+        from collections import Counter
+        from pathlib import Path
+
+        from selenium.webdriver.common.by import By
+
+        driver = self._build_driver()
+        try:
+            driver.get(url or f"{self.base_url}/#/AS/B1/")
+            time.sleep(10)  # let the SPA render
+            self._dismiss_cookies(driver)
+            time.sleep(2)
+
+            html = driver.page_source
+            Path(f"{out_prefix}.html").write_text(html, encoding="utf-8")
+            driver.save_screenshot(f"{out_prefix}.png")
+
+            print(f"Title : {driver.title}")
+            print(f"URL   : {driver.current_url}")
+            print(f"Saved : {out_prefix}.html, {out_prefix}.png")
+
+            print("\n--- SELECTORS hit counts ---")
+            for name, selector in SELECTORS.items():
+                count = len(driver.find_elements(By.CSS_SELECTOR, selector))
+                print(f"{name:<22} {count:>4}  ({selector})")
+
+            print("\n--- frequent CSS classes (interesting families) ---")
+            tokens: Counter = Counter()
+            for attr in re.findall(r'class="([^"]*)"', html):
+                for token in attr.split():
+                    if re.search(
+                        r"Coupon|Market|Particip|Fixture|Label|Link|Button|Header|Odds|Classification",
+                        token,
+                    ):
+                        tokens[token] += 1
+            for token, count in tokens.most_common(50):
+                print(f"{count:>5}  {token}")
+
+            print("\n--- sample clickable texts ---")
+            seen: set = set()
+            elements = driver.find_elements(
+                By.CSS_SELECTOR, "a, [class*='Link'], [class*='Button'], [class*='Label']"
+            )
+            for element in elements[:400]:
+                text = element.text.strip().replace("\n", " / ")[:60]
+                if text and text not in seen:
+                    seen.add(text)
+                    print(f"  {text}")
+                if len(seen) >= 40:
+                    break
+        finally:
+            driver.quit()
+
+    # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
 

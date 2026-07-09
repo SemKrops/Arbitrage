@@ -59,6 +59,15 @@ def main(argv: list[str] | None = None) -> int:
         help="search Unibet/Kambi's football competition tree by name "
         "(e.g. 'world', 'wk') and print the matching paths, then exit",
     )
+    parser.add_argument(
+        "--dump-bet365",
+        nargs="?",
+        const="",
+        metavar="URL",
+        help="open bet365 (football section, or URL if given) with the "
+        "Selenium provider and print selector hit counts, CSS classes and "
+        "link texts; saves bet365_dump.html/.png for diagnosing DOM changes",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
 
@@ -68,6 +77,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     config = Config.from_env()
+
+    if args.dump_bet365 is not None:
+        from .providers.bet365_selenium import SeleniumBet365Provider
+
+        SeleniumBet365Provider().dump_page(args.dump_bet365 or None)
+        return 0
 
     if args.find_competition:
         from .providers.kambi import KambiUnibetProvider
