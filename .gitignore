@@ -8,3 +8,5 @@ venv/
 # bet365 diagnostic dump artifacts
 bet365_dump*.html
 bet365_dump*.png
+bet365_coupon_*.html
+bet365_coupon_*.png

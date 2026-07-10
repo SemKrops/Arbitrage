@@ -890,20 +890,7 @@ class SeleniumBet365Provider(OddsProvider):
             competition.value, len(fixtures), fixtures[: self.max_events],
         )
         if not fixtures:
-            try:
-                # Scroll once more, then report what rendered so the row
-                # selector can be pinned to the coupon's real classes.
-                driver.execute_script("window.scrollBy(0, 1200);")
-                time.sleep(2)
-                diag = driver.execute_script(_FIXTURE_DIAG_JS)
-                log.warning(
-                    "Bet365: no fixtures parsed on the coupon page. Fixture-ish "
-                    "classes present: %s\n  sample texts: %s\n  (share this so "
-                    "the row selector can be updated)",
-                    diag.get("classes"), diag.get("samples"),
-                )
-            except Exception:
-                pass
+            self._report_empty_coupon(driver, competition)
         props: list[PropOdds] = []
         for name in fixtures[: self.max_events]:
             try:
@@ -1050,6 +1037,46 @@ class SeleniumBet365Provider(OddsProvider):
                         break
             time.sleep(1)
         return False
+
+    def _report_empty_coupon(self, driver, competition: Competition) -> None:
+        """Save a screenshot + HTML and log the DOM classes for diagnosis."""
+        from pathlib import Path
+
+        prefix = f"bet365_coupon_{competition.value}"
+        try:
+            driver.execute_script("window.scrollBy(0, 1200);")
+            time.sleep(2)
+        except Exception:
+            pass
+        saved = []
+        try:
+            driver.save_screenshot(f"{prefix}.png")
+            saved.append(f"{prefix}.png")
+        except Exception:
+            pass
+        try:
+            Path(f"{prefix}.html").write_text(driver.page_source, encoding="utf-8")
+            saved.append(f"{prefix}.html")
+        except Exception:
+            pass
+        try:
+            diag = driver.execute_script(_FIXTURE_DIAG_JS)
+            classes, samples = diag.get("classes"), diag.get("samples")
+        except Exception:
+            classes, samples = None, None
+        try:
+            body_len = driver.execute_script(
+                "return document.body ? document.body.innerText.length : 0"
+            )
+        except Exception:
+            body_len = "?"
+        log.warning(
+            "Bet365: reached the %s page but found 0 fixtures (page text "
+            "length=%s). Saved %s — open the .png to see the page state and "
+            "send it over. Fixture-ish classes: %s\n  sample texts: %s",
+            competition.value, body_len, saved or "nothing",
+            classes, samples,
+        )
 
     def _settle_coupon(self, driver) -> None:
         """Wait for and scroll the coupon so its fixtures lazily render."""
