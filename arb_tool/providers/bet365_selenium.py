@@ -104,6 +104,15 @@ COMPETITION_LINK_PATTERNS = {
     Competition.WORLD_CUP: r"^(wk( \d{4})?|(fifa )?world cup( \d{4})?|wereldkampioenschap( \d{4})?)$",
 }
 
+# Keywords expected in the coupon's main header once we've actually landed on
+# the competition's page — used to confirm navigation reached the right place
+# (and not, say, the homepage's mixed "Upcoming" widget).
+COMPETITION_COUPON_KEYWORDS = {
+    Competition.PREMIER_LEAGUE: ("premier league",),
+    Competition.LA_LIGA: ("laliga", "la liga"),
+    Competition.WORLD_CUP: ("wk voetbal", "wk 2026", "wereldkampioenschap", "world cup"),
+}
+
 # Injected before any page script runs: bet365 creates its shadow roots
 # closed, which hides them from automation; force them open. The flag lets
 # diagnostics confirm the pre-load injection actually ran.
@@ -857,29 +866,8 @@ class SeleniumBet365Provider(OddsProvider):
     def _scrape_competition(self, driver, competition: Competition) -> list[PropOdds]:
         """Open the competition's coupon and scrape every listed match."""
         self._current_competition = competition
-        coupon = next((u for c, u in self.coupon_urls if c is competition), None)
-
-        if coupon:
-            self._coupon_return_url = coupon
-            driver.get(coupon)  # plain load, no refresh (refresh -> "expired")
-            if self._is_dead_page(driver):
-                log.warning(
-                    "Bet365: %s coupon page is no longer available (%s) — "
-                    "re-copy the competition URL from your browser.",
-                    competition.value, coupon,
-                )
-                return []
-            self._settle_coupon(driver)
-        else:
-            self._coupon_return_url = None
-            log.warning(
-                "Bet365: no coupon URL for %s. Set BET365_COMPETITION_URLS="
-                "%s=<url of the competition page in your browser> for reliable "
-                "auto-scanning; attempting menu navigation as a fallback.",
-                competition.value, competition.value,
-            )
-            if not self._open_competition_page(driver, competition):
-                return []
+        if not self._open_competition_page(driver, competition):
+            return []
 
         fixtures = [name for _, name in self._list_fixtures(driver)]
         log.info(
@@ -934,32 +922,66 @@ class SeleniumBet365Provider(OddsProvider):
     # ---------------- competition/fixture navigation ------------------- #
 
     def _open_competition_page(self, driver, competition: Competition) -> bool:
-        """Reach the competition's fixture list by clicking through the app.
+        """Reach the competition's coupon, ready to list fixtures.
 
-        No hash deep-links or refreshes: bet365 treats a hard refresh of a
-        hash route as an expired page ("niet langer beschikbaar"). Instead
-        boot the app at the root and navigate the way a user does — click
-        Football, then the competition — matching links by visible text
-        (which survives bet365's class obfuscation).
+        Order: (1) a configured coupon URL if it still resolves; (2) clicking
+        the competition's sidebar link, verified by the coupon header so we
+        don't accept the homepage's mixed 'Upcoming' widget. No hard refresh
+        of hash routes (bet365 treats that as an expired page).
         """
+        coupon = next((u for c, u in self.coupon_urls if c is competition), None)
+        if coupon:
+            driver.get(coupon)  # plain load, no refresh
+            if not self._is_dead_page(driver):
+                self._settle_coupon(driver)
+                if self._list_fixtures(driver):
+                    self._coupon_return_url = coupon
+                    return True
+            log.info(
+                "Bet365: coupon URL for %s not usable (expired/dead); "
+                "navigating via the sidebar instead.", competition.value,
+            )
+
+        # Sidebar navigation (URL-free, robust to expiry).
+        self._coupon_return_url = None
         if not self._page_has_content(driver):
             self._bootstrap(driver)
         pattern = COMPETITION_LINK_PATTERNS[competition]
-
-        # If the competition link isn't visible yet, open the Football menu.
         if not driver.execute_script(_TEXT_CANDIDATES_JS, pattern):
-            self._click_text(driver, r"^(voetbal|football)$", lambda: True)
+            self._quick_click_text(driver, r"^(voetbal|football)$")  # reveal menu
             time.sleep(2)
 
         if self._click_text(
-            driver, pattern, lambda: bool(self._list_fixtures(driver))
+            driver, pattern, lambda: self._on_competition_coupon(driver, competition)
         ):
+            self._settle_coupon(driver)
             return True
         log.warning(
-            "Bet365: could not reach %s fixtures (dead page=%s). The "
-            "competition may not be listed, or navigation changed.",
+            "Bet365: could not reach %s coupon (dead page=%s). The competition "
+            "may not be listed right now, or its layout changed.",
             competition.value, self._is_dead_page(driver),
         )
+        return False
+
+    def _on_competition_coupon(self, driver, competition: Competition) -> bool:
+        """True once the main coupon area shows this competition's page."""
+        if self._is_dead_page(driver):
+            return False
+        try:
+            text = driver.execute_script(
+                "const m = document.querySelector("
+                "  '[class*=\"CouponPage\"], [class*=\"PageViewMain\"]');"
+                "return m ? (m.innerText || '').slice(0, 300).toLowerCase() : '';"
+            )
+        except Exception:
+            return False
+        return any(k in text for k in COMPETITION_COUPON_KEYWORDS[competition])
+
+    def _quick_click_text(self, driver, pattern: str) -> bool:
+        """One-shot: click the first element matching ``pattern`` (no polling)."""
+        for element in driver.execute_script(_TEXT_CANDIDATES_JS, pattern):
+            if self._click(driver, element):
+                return True
         return False
 
     def _click_text(self, driver, pattern: str, done) -> bool:
@@ -1000,7 +1022,7 @@ class SeleniumBet365Provider(OddsProvider):
             '.gl-MarketGroupPod, [class*="ParticipantFixtureDetails"]',
         )
         # Make sure the "Wedstrijden"/"Matches" (fixtures) view is selected.
-        self._click_text(driver, r"^(wedstrijden|matches|fixtures)$", lambda: True)
+        self._quick_click_text(driver, r"^(wedstrijden|matches|fixtures)$")
         deadline = time.time() + self.page_timeout
         while time.time() < deadline:
             if self._list_fixtures(driver):
@@ -1056,17 +1078,19 @@ class SeleniumBet365Provider(OddsProvider):
         return False
 
     def _return_to_list(self, driver) -> None:
-        """Return to the coupon: reload its URL if we have one, else go back."""
+        """Return to the coupon between matches."""
         if self._coupon_return_url:
             driver.get(self._coupon_return_url)  # plain load, reliable
+            self._settle_coupon(driver)
         else:
             try:
-                driver.back()
+                driver.back()  # in-app history restores the coupon
             except Exception:
                 pass
-        if not self._wait_until(lambda: self._list_fixtures(driver)):
-            if self._current_competition is not None and not self._coupon_return_url:
-                self._open_competition_page(driver, self._current_competition)
+            if not self._wait_until(lambda: self._list_fixtures(driver)):
+                # History didn't restore it; re-navigate from the sidebar.
+                if self._current_competition is not None:
+                    self._open_competition_page(driver, self._current_competition)
 
     def _wait_until(self, condition) -> bool:
         deadline = time.time() + self.page_timeout
