@@ -245,8 +245,9 @@ return out;
 """
 
 # List the fixtures on a competition coupon page as [element, "A v B"] pairs.
-# Prefers bet365's coupon classes; falls back to leaf "X v Y" texts outside
-# the (obfuscated) navigation chrome.
+# Handles three bet365 layouts: a single element holding both team names
+# (stacked), a pair of sibling team-name elements per fixture, and — as a
+# last resort — leaf "X v Y" texts outside the (obfuscated) nav chrome.
 _FIXTURE_ROWS_JS = r"""
 const roots = [];
 function collectRoots(root) {
@@ -258,20 +259,40 @@ collectRoots(document);
 
 const out = [];
 const seen = new Set();
+function push(el, name) {
+  name = (name || '').trim();
+  if (name && name.includes(' v ') && !seen.has(name)) {
+    seen.add(name);
+    out.push([el, name]);
+  }
+}
+
+// 1. A single element containing both team names (newline/￼ separated).
 for (const root of roots) {
   for (const el of root.querySelectorAll(
     '.rcl-ParticipantFixtureDetails_TeamNames, [class*="FixtureDetails_TeamNames"], ' +
-    '.sl-CouponParticipantWithBookCloses_Name'
+    '.sl-CouponParticipantWithBookCloses_Name, [class*="_TeamNames"]'
   )) {
-    const name = (el.innerText || '').trim().replace(/\s*\n\s*/g, ' v ');
-    if (name && name.includes(' v ') && !seen.has(name)) {
-      seen.add(name);
-      out.push([el, name]);
-    }
+    push(el, (el.innerText || '').trim().replace(/\s*\n\s*/g, ' v '));
   }
 }
 if (out.length) return out;
 
+// 2. Two sibling team-name elements per fixture (home + away).
+for (const root of roots) {
+  const teams = root.querySelectorAll(
+    '[class*="FixtureDetails_Team"]:not([class*="TeamNames"]), ' +
+    '[class*="TwoWay_TeamName"], [class*="Competitor_Name"], [class*="_TeamName"]'
+  );
+  for (let i = 0; i + 1 < teams.length; i += 2) {
+    const a = (teams[i].innerText || '').trim();
+    const b = (teams[i + 1].innerText || '').trim();
+    if (a && b) push(teams[i], a + ' v ' + b);
+  }
+}
+if (out.length) return out;
+
+// 3. Leaf "X v Y" texts outside the navigation/header chrome.
 function inChrome(el) {
   let n = el;
   for (let i = 0; i < 14 && n; i++) {
@@ -287,13 +308,41 @@ for (const root of roots) {
   for (const el of root.querySelectorAll('a, div, span')) {
     if (el.children.length > 3) continue;
     const t = (el.innerText || '').trim();
-    if (re.test(t) && !inChrome(el) && !seen.has(t)) {
-      seen.add(t);
-      out.push([el, t]);
-    }
+    if (re.test(t) && !inChrome(el)) push(el, t);
   }
 }
 return out;
+"""
+
+# When no fixtures are found, report the coupon's fixture-ish classes and
+# sample texts so the row selector can be fixed.
+_FIXTURE_DIAG_JS = r"""
+const roots = [];
+function collectRoots(root) {
+  if (!root.querySelectorAll) return;
+  roots.push(root);
+  for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collectRoots(el.shadowRoot);
+}
+collectRoots(document);
+const re = /Fixture|Participant|Competitor|Coupon|Team|Event|Match|Scoreboard/;
+const classes = {};
+const samples = [];
+const seen = new Set();
+for (const root of roots) {
+  for (const el of root.querySelectorAll('*')) {
+    if (!el.classList) continue;
+    let hit = false;
+    for (const c of el.classList) {
+      if (re.test(c)) { classes[c] = (classes[c] || 0) + 1; hit = true; }
+    }
+    if (hit) {
+      const t = (el.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 50);
+      if (t && !seen.has(t) && seen.size < 25) { seen.add(t); samples.push(t); }
+    }
+  }
+}
+const ranked = Object.entries(classes).sort((a, b) => b[1] - a[1]).slice(0, 30);
+return { classes: ranked, samples: samples };
 """
 
 # Extract the shots milestone grids into structured rows. Each shots pod is
@@ -837,6 +886,17 @@ class SeleniumBet365Provider(OddsProvider):
             "Bet365: %s — %d fixtures listed: %s",
             competition.value, len(fixtures), fixtures[: self.max_events],
         )
+        if not fixtures:
+            try:
+                diag = driver.execute_script(_FIXTURE_DIAG_JS)
+                log.warning(
+                    "Bet365: no fixtures parsed on the coupon page. Fixture-ish "
+                    "classes present: %s\n  sample texts: %s\n  (share this so "
+                    "the row selector can be updated)",
+                    diag.get("classes"), diag.get("samples"),
+                )
+            except Exception:
+                pass
         props: list[PropOdds] = []
         for name in fixtures[: self.max_events]:
             try:
