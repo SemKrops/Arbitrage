@@ -800,15 +800,34 @@ class SeleniumBet365Provider(OddsProvider):
         return (driver.execute_script("return arguments[0].innerText", element) or "").strip()
 
     def _click(self, driver, element) -> bool:
-        """Fire a full pointer+mouse event sequence on ``element``.
+        """Click ``element`` with a real (trusted) browser click when possible.
 
-        bet365's nav/menu handlers bind to pointerdown/mousedown, which a bare
-        element.click() does not trigger — so dispatch the whole sequence.
+        bet365's consent/menu handlers ignore synthetic JS-dispatched events
+        (isTrusted=false), so try Selenium's native click first — that's a
+        genuine browser click. Fall back to a dispatched pointer+mouse
+        sequence only when the element is covered/not directly clickable.
         """
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", element
+            )
+        except StaleElementReferenceException:
+            return False
+        except Exception:
+            pass
+        try:
+            element.click()  # native, trusted
+            return True
+        except StaleElementReferenceException:
+            return False
+        except Exception:
+            pass
         try:
             driver.execute_script(_FULL_CLICK_JS, element)
             return True
         except StaleElementReferenceException:
+            return False
+        except Exception:
             return False
 
     # ------------------------------------------------------------------ #
@@ -1523,19 +1542,35 @@ class SeleniumBet365Provider(OddsProvider):
     def _dismiss_cookies(self, driver) -> None:
         """Accept the cookie banner — bet365 won't render content until then.
 
-        The current NL banner has no stable class, so match the button by
-        its visible text ("Alles accepteren"); keep the old class selector as
-        a fallback for other locales/versions.
+        The banner can appear a beat after load and has no stable class, so
+        poll for the accept button (matched by visible text) for a few
+        seconds and confirm the banner is actually gone.
         """
-        clicked = self._quick_click_text(
-            driver,
+        accept_re = (
             r"^(alles accepteren|accepteren|accepteer alles|accept all|"
-            r"accept|ik ga akkoord|akkoord|allow all)$",
+            r"accept|ik ga akkoord|akkoord|allow all)$"
         )
-        for button in self._query(driver, SELECTORS["cookie_accept"]):
-            clicked = self._click(driver, button) or clicked
-        if clicked:
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            if not self._cookie_banner_present(driver):
+                return
+            clicked = self._quick_click_text(driver, accept_re)
+            for button in self._query(driver, SELECTORS["cookie_accept"]):
+                clicked = self._click(driver, button) or clicked
             time.sleep(1)
+            if not self._cookie_banner_present(driver):
+                return
+            time.sleep(0.5)
+        log.info("Bet365: cookie banner still present after retries")
+
+    def _cookie_banner_present(self, driver) -> bool:
+        try:
+            text = driver.execute_script(
+                "return document.body ? document.body.innerText.toLowerCase() : ''"
+            )
+        except Exception:
+            return False
+        return "gebruik van cookies" in text or "use of cookies" in text
 
     def _wait_for(self, driver, selector: str, timeout: float | None = None) -> bool:
         """Wait until ``selector`` exists, searching iframes and shadow DOM.
