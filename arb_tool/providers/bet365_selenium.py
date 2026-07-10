@@ -968,19 +968,33 @@ class SeleniumBet365Provider(OddsProvider):
         ):
             self._settle_coupon(driver)
             return True
+
+        # Save where we ended up so the navigation can be diagnosed.
+        shot = f"bet365_nav_{competition.value}.png"
+        try:
+            driver.save_screenshot(shot)
+        except Exception:
+            shot = "nothing"
+        try:
+            head = driver.execute_script(
+                "return (document.body ? document.body.innerText : '').slice(0, 200)"
+            )
+        except Exception:
+            head = ""
         log.warning(
-            "Bet365: could not reach %s coupon (dead page=%s). The competition "
-            "may not be listed right now, or its layout changed.",
-            competition.value, self._is_dead_page(driver),
+            "Bet365: could not reach %s coupon (dead page=%s). Saved %s — send "
+            "it over. Page starts with: %r",
+            competition.value, self._is_dead_page(driver), shot, head,
         )
         return False
 
     def _on_competition_coupon(self, driver, competition: Competition) -> bool:
-        """True once the coupon's own header names this competition.
+        """True once we've reached this competition's content.
 
-        Checks a coupon-specific container's leading text (e.g. "WK voetbal
-        2026 …") — NOT a broad page container that also wraps the sidebar,
-        which would falsely match the "WK 2026" nav item on the homepage.
+        Accepts either the coupon's own header naming the competition (e.g.
+        "WK voetbal 2026 …" — a coupon-specific container, NOT a broad one
+        that also wraps the sidebar's "WK 2026" nav item) OR a page that
+        already shows shots markets (navigation can land straight on a match).
         """
         if self._is_dead_page(driver):
             return False
@@ -995,10 +1009,17 @@ class SeleniumBet365Provider(OddsProvider):
                 "return null;"
             )
         except Exception:
+            header = None
+        if header and any(k in header for k in COMPETITION_COUPON_KEYWORDS[competition]):
+            return True
+        return self._has_shots(driver)
+
+    def _has_shots(self, driver) -> bool:
+        """True when the current page renders any player-shots market grid."""
+        try:
+            return bool(driver.execute_script(_SHOTS_PROPS_JS))
+        except Exception:
             return False
-        if not header:
-            return False
-        return any(k in header for k in COMPETITION_COUPON_KEYWORDS[competition])
 
     def _quick_click_text(self, driver, pattern: str) -> bool:
         """One-shot: click the first element matching ``pattern`` (no polling)."""
