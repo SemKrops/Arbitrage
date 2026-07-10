@@ -58,6 +58,12 @@ import time
 from ..models import Competition, Market, PropOdds
 from .base import OddsProvider
 
+try:
+    from selenium.common.exceptions import StaleElementReferenceException
+except ImportError:  # selenium not installed (non-selenium runs)
+    class StaleElementReferenceException(Exception):
+        pass
+
 log = logging.getLogger(__name__)
 
 # All bet365 CSS class names in one place — first thing to check when the
@@ -574,7 +580,12 @@ class SeleniumBet365Provider(OddsProvider):
         # comma/newline separated, e.g.:
         #   BET365_MATCH_URLS=world_cup=https://www.bet365.nl/#/AC/.../
         self.match_urls = _parse_match_urls(os.environ.get("BET365_MATCH_URLS", ""))
+        # Competition coupon pages (competition=url), the reliable way to reach
+        # a tournament's fixtures: copy the URL your browser shows on e.g. the
+        # "WK 2026" page. The scraper loads it and scrapes every listed match.
+        self.coupon_urls = _parse_match_urls(os.environ.get("BET365_COMPETITION_URLS", ""))
         self._current_competition: Competition | None = None
+        self._coupon_return_url: str | None = None
 
     # ------------------------------------------------------------------ #
     # Browser setup
@@ -716,8 +727,12 @@ class SeleniumBet365Provider(OddsProvider):
     def _text(self, driver, element) -> str:
         return (driver.execute_script("return arguments[0].innerText", element) or "").strip()
 
-    def _click(self, driver, element) -> None:
-        driver.execute_script("arguments[0].click()", element)
+    def _click(self, driver, element) -> bool:
+        try:
+            driver.execute_script("arguments[0].click()", element)
+            return True
+        except StaleElementReferenceException:
+            return False
 
     # ------------------------------------------------------------------ #
     # Navigation
@@ -791,16 +806,37 @@ class SeleniumBet365Provider(OddsProvider):
         )
 
     def _scrape_competition(self, driver, competition: Competition) -> list[PropOdds]:
-        """Open the competition from the nav and scrape every listed match."""
+        """Open the competition's coupon and scrape every listed match."""
         self._current_competition = competition
-        if not self._open_competition_page(driver, competition):
-            return []
+        coupon = next((u for c, u in self.coupon_urls if c is competition), None)
+
+        if coupon:
+            self._coupon_return_url = coupon
+            driver.get(coupon)  # plain load, no refresh (refresh -> "expired")
+            self._wait_until(lambda: self._list_fixtures(driver))
+            if self._is_dead_page(driver):
+                log.warning(
+                    "Bet365: %s coupon page is no longer available (%s) — "
+                    "re-copy the competition URL from your browser.",
+                    competition.value, coupon,
+                )
+                return []
+        else:
+            self._coupon_return_url = None
+            log.warning(
+                "Bet365: no coupon URL for %s. Set BET365_COMPETITION_URLS="
+                "%s=<url of the competition page in your browser> for reliable "
+                "auto-scanning; attempting menu navigation as a fallback.",
+                competition.value, competition.value,
+            )
+            if not self._open_competition_page(driver, competition):
+                return []
+
         fixtures = [name for _, name in self._list_fixtures(driver)]
         log.info(
             "Bet365: %s — %d fixtures listed: %s",
             competition.value, len(fixtures), fixtures[: self.max_events],
         )
-        list_url = driver.current_url
         props: list[PropOdds] = []
         for name in fixtures[: self.max_events]:
             try:
@@ -810,8 +846,10 @@ class SeleniumBet365Provider(OddsProvider):
                 props.extend(
                     self._scrape_current_match(driver, competition, fallback_name=name)
                 )
+            except StaleElementReferenceException:
+                log.debug("Bet365: stale element on fixture %r, skipping", name)
             finally:
-                self._return_to_list(driver, list_url)
+                self._return_to_list(driver)
         return props
 
     def _scrape_current_match(
@@ -895,37 +933,52 @@ class SeleniumBet365Provider(OddsProvider):
         return [(el, name) for el, name in rows]
 
     def _open_fixture(self, driver, name: str) -> bool:
-        """Click the fixture row with this name and wait for the match page."""
-        for element, row_name in self._list_fixtures(driver):
-            if row_name != name:
-                continue
-            # Click the row (or a clickable ancestor if the label ignores it).
-            target = element
-            for _ in range(4):
-                self._click(driver, target)
-                if self._wait_for(
-                    driver, ".sph-MarketGroupNavBarButton, .gl-MarketGroupPod",
-                    timeout=6,
-                ):
-                    return True
-                parent = driver.execute_script(
+        """Click the fixture row with this name and wait for the match page.
+
+        Re-queries the row fresh (elements from a prior render go stale after
+        navigation) and climbs to a clickable ancestor if the label itself
+        doesn't handle the click.
+        """
+        try:
+            row = next(
+                (el for el, row_name in self._list_fixtures(driver) if row_name == name),
+                None,
+            )
+        except StaleElementReferenceException:
+            row = None
+        if row is None:
+            return False
+
+        target = row
+        for _ in range(4):
+            if not self._click(driver, target):
+                return False  # went stale
+            if self._wait_for(
+                driver, ".sph-MarketGroupNavBarButton, .gl-MarketGroupPod", timeout=6
+            ):
+                return True
+            try:
+                target = driver.execute_script(
                     "return arguments[0].parentElement", target
                 )
-                if parent is None:
-                    break
-                target = parent
-            return False
+            except StaleElementReferenceException:
+                return False
+            if target is None:
+                break
         return False
 
-    def _return_to_list(self, driver, list_url: str) -> None:
-        """Go back to the coupon via in-app history (never a hard refresh)."""
-        try:
-            driver.back()
-        except Exception:
-            pass
+    def _return_to_list(self, driver) -> None:
+        """Return to the coupon: reload its URL if we have one, else go back."""
+        if self._coupon_return_url:
+            driver.get(self._coupon_return_url)  # plain load, reliable
+        else:
+            try:
+                driver.back()
+            except Exception:
+                pass
         if not self._wait_until(lambda: self._list_fixtures(driver)):
-            # History didn't restore the coupon; re-navigate by clicking.
-            self._open_competition_page(driver, self._current_competition)
+            if self._current_competition is not None and not self._coupon_return_url:
+                self._open_competition_page(driver, self._current_competition)
 
     def _wait_until(self, condition) -> bool:
         deadline = time.time() + self.page_timeout
