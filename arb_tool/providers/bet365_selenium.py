@@ -890,7 +890,17 @@ class SeleniumBet365Provider(OddsProvider):
             competition.value, len(fixtures), fixtures[: self.max_events],
         )
         if not fixtures:
+            # Navigation may have landed directly on a match page that already
+            # shows the shots grid — parse it instead of reporting empty.
+            direct = self._scrape_current_match(driver, competition, fallback_name="")
+            if direct:
+                log.info(
+                    "Bet365: no fixture list, but the current page had %d shots "
+                    "props — scraped those.", len(direct),
+                )
+                return direct
             self._report_empty_coupon(driver, competition)
+            return []
         props: list[PropOdds] = []
         for name in fixtures[: self.max_events]:
             try:
