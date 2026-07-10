@@ -574,6 +574,7 @@ class SeleniumBet365Provider(OddsProvider):
         # comma/newline separated, e.g.:
         #   BET365_MATCH_URLS=world_cup=https://www.bet365.nl/#/AC/.../
         self.match_urls = _parse_match_urls(os.environ.get("BET365_MATCH_URLS", ""))
+        self._current_competition: Competition | None = None
 
     # ------------------------------------------------------------------ #
     # Browser setup
@@ -791,6 +792,7 @@ class SeleniumBet365Provider(OddsProvider):
 
     def _scrape_competition(self, driver, competition: Competition) -> list[PropOdds]:
         """Open the competition from the nav and scrape every listed match."""
+        self._current_competition = competition
         if not self._open_competition_page(driver, competition):
             return []
         fixtures = [name for _, name in self._list_fixtures(driver)]
@@ -830,31 +832,62 @@ class SeleniumBet365Provider(OddsProvider):
     # ---------------- competition/fixture navigation ------------------- #
 
     def _open_competition_page(self, driver, competition: Competition) -> bool:
-        """Click the competition's nav link (found by text) from the base page."""
-        driver.get(f"{self.base_url}/#/AS/B1/")
-        driver.refresh()  # hash-only navigation doesn't re-route the SPA
-        self._wait_for(driver, "body")
-        self._dismiss_cookies(driver)
+        """Reach the competition's fixture list by clicking through the app.
+
+        No hash deep-links or refreshes: bet365 treats a hard refresh of a
+        hash route as an expired page ("niet langer beschikbaar"). Instead
+        boot the app at the root and navigate the way a user does — click
+        Football, then the competition — matching links by visible text
+        (which survives bet365's class obfuscation).
+        """
+        if not self._page_has_content(driver):
+            self._bootstrap(driver)
         pattern = COMPETITION_LINK_PATTERNS[competition]
-        deadline = time.time() + self.page_timeout
-        links = []
-        while time.time() < deadline and not links:
-            links = driver.execute_script(_TEXT_CANDIDATES_JS, pattern)
-            if not links:
-                time.sleep(1)
-        if not links:
-            log.warning(
-                "Bet365: no %s link found in navigation (pattern %s) — check "
-                "the competition is listed on the site.",
-                competition.value, pattern,
-            )
-            return False
-        self._click(driver, links[0])
-        if self._wait_until(lambda: self._list_fixtures(driver)):
+
+        # If the competition link isn't visible yet, open the Football menu.
+        if not driver.execute_script(_TEXT_CANDIDATES_JS, pattern):
+            self._click_text(driver, r"^(voetbal|football)$", lambda: True)
+            time.sleep(2)
+
+        if self._click_text(
+            driver, pattern, lambda: bool(self._list_fixtures(driver))
+        ):
             return True
         log.warning(
-            "Bet365: clicked %s but no fixture list appeared", competition.value
+            "Bet365: could not reach %s fixtures (dead page=%s). The "
+            "competition may not be listed, or navigation changed.",
+            competition.value, self._is_dead_page(driver),
         )
+        return False
+
+    def _click_text(self, driver, pattern: str, done) -> bool:
+        """Click the element whose visible text matches ``pattern``.
+
+        Tries each candidate and climbs to clickable ancestors (bet365 often
+        puts the click handler above the text span), polling ``done`` after
+        each click. Returns True as soon as ``done()`` holds.
+        """
+        deadline = time.time() + self.page_timeout
+        while time.time() < deadline:
+            for element in driver.execute_script(_TEXT_CANDIDATES_JS, pattern):
+                target = element
+                for _ in range(4):
+                    try:
+                        self._click(driver, target)
+                    except Exception:
+                        break
+                    time.sleep(1.5)
+                    try:
+                        if done():
+                            return True
+                    except Exception:
+                        pass
+                    target = driver.execute_script(
+                        "return arguments[0].parentElement", target
+                    )
+                    if target is None:
+                        break
+            time.sleep(1)
         return False
 
     def _list_fixtures(self, driver) -> list[tuple[object, str]]:
@@ -885,9 +918,14 @@ class SeleniumBet365Provider(OddsProvider):
         return False
 
     def _return_to_list(self, driver, list_url: str) -> None:
-        driver.get(list_url)
-        driver.refresh()  # force the SPA to re-route to the coupon
-        self._wait_until(lambda: self._list_fixtures(driver))
+        """Go back to the coupon via in-app history (never a hard refresh)."""
+        try:
+            driver.back()
+        except Exception:
+            pass
+        if not self._wait_until(lambda: self._list_fixtures(driver)):
+            # History didn't restore the coupon; re-navigate by clicking.
+            self._open_competition_page(driver, self._current_competition)
 
     def _wait_until(self, condition) -> bool:
         deadline = time.time() + self.page_timeout
@@ -900,30 +938,42 @@ class SeleniumBet365Provider(OddsProvider):
             time.sleep(1)
         return False
 
-    def _bootstrap(self, driver) -> None:
-        """Load the main site once so the SPA initialises before deep links."""
+    def _page_has_content(self, driver) -> bool:
+        """True when the app has booted to a real page (not blank/dead)."""
         try:
-            driver.get(f"{self.base_url}/#/AS/B1/")
-            self._wait_for(driver, ".hrm-7, .wc-PageView, .gl-MarketGroupPod, .sln-8")
+            text = driver.execute_script(
+                "return document.body ? document.body.innerText : ''"
+            )
+        except Exception:
+            return False
+        return len(text.strip()) > 200 and not self._is_dead_page(driver)
+
+    def _bootstrap(self, driver) -> None:
+        """Load the site root (no hash) and let the SPA fully initialise."""
+        try:
+            driver.get(self.base_url + "/")
+            self._wait_for(driver, "body")
             self._dismiss_cookies(driver)
+            self._wait_until(lambda: self._page_has_content(driver))
             time.sleep(2)
         except Exception as exc:  # pragma: no cover - best effort
             log.debug("Bet365: bootstrap load failed: %s", exc)
 
     def _open_match(self, driver, url: str) -> None:
-        """Navigate to a match page, reloading if the markets don't render.
+        """Navigate to an explicit match URL and wait for its market bar.
 
-        bet365 is a hash-routed SPA: driver.get() onto a different #/...
-        fragment doesn't re-route the app, so force a refresh to boot the
-        SPA directly at the match route.
+        Uses a single driver.get() (which loads the full document at that
+        hash route) — no driver.refresh(), since a hard refresh makes bet365
+        report the hash route as an expired page.
         """
-        driver.get(url)
         for attempt in range(3):
-            driver.refresh()
+            driver.get(url)
             if self._wait_for(driver, ".sph-MarketGroupNavBarButton, .gl-MarketGroupPod"):
                 return
+            if self._is_dead_page(driver):
+                return  # caller detects and reports the dead page
             log.info(
-                "Bet365: match page markets not ready (attempt %d/3), reloading",
+                "Bet365: match page markets not ready (attempt %d/3), retrying",
                 attempt + 1,
             )
             time.sleep(2)
