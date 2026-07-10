@@ -513,8 +513,10 @@ class SeleniumBet365Provider(OddsProvider):
             from selenium.common.exceptions import SessionNotCreatedException
 
             log.info("Bet365: using undetected-chromedriver")
-            pinned = os.environ.get("BET365_CHROME_VERSION", "")
-            version_main = int(pinned) if pinned else None
+            # Detect the installed Chrome major version up front so the first
+            # launch already downloads the matching driver — avoids uc's
+            # default of fetching the newest driver, failing, and relaunching.
+            version_main = self._detect_chrome_major()
 
             def launch(version):
                 # A ChromeOptions object cannot be reused between attempts.
@@ -529,12 +531,11 @@ class SeleniumBet365Provider(OddsProvider):
             try:
                 return launch(version_main)
             except SessionNotCreatedException as exc:
-                # uc fetched a driver for the newest Chrome, but the locally
-                # installed browser lags behind ("This version of ChromeDriver
-                # only supports Chrome version 150. Current browser version is
-                # 149..."). Retry pinned to the browser's actual version.
+                # Detection failed or was wrong; recover from the error text
+                # ("...only supports Chrome version 150. Current browser
+                # version is 149...") and retry once with the real version.
                 detected = re.search(r"[Cc]urrent browser version is (\d+)", str(exc))
-                if detected is None:
+                if detected is None or int(detected.group(1)) == version_main:
                     raise
                 version = int(detected.group(1))
                 log.info(
@@ -571,6 +572,49 @@ class SeleniumBet365Provider(OddsProvider):
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument", {"source": _FORCE_OPEN_SHADOW_JS}
         )
+
+    def _detect_chrome_major(self) -> int | None:
+        """Best-effort detection of the installed Chrome major version.
+
+        Order: BET365_CHROME_VERSION env, Windows registry, running the
+        Chrome binary with --version. Returns None if all fail (the caller
+        then falls back to uc's default plus the mismatch retry).
+        """
+        pinned = os.environ.get("BET365_CHROME_VERSION", "")
+        if pinned.isdigit():
+            return int(pinned)
+
+        # Windows: BLBeacon holds the installed version string.
+        try:
+            import winreg  # type: ignore
+
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, r"Software\Google\Chrome\BLBeacon") as key:
+                        version, _ = winreg.QueryValueEx(key, "version")
+                        return int(str(version).split(".")[0])
+                except OSError:
+                    continue
+        except ImportError:
+            pass  # not Windows
+
+        # POSIX / fallback: ask the binary.
+        import shutil
+        import subprocess
+
+        binary = self.chrome_binary or shutil.which("google-chrome") or \
+            shutil.which("chromium") or shutil.which("chrome")
+        if binary:
+            try:
+                out = subprocess.run(
+                    [binary, "--version"], capture_output=True, text=True, timeout=10
+                ).stdout
+                match = re.search(r"(\d+)\.\d+", out)
+                if match:
+                    return int(match.group(1))
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return None
 
     def _apply_common_options(self, options) -> None:
         options.add_argument("--window-size=1600,1000")
@@ -622,9 +666,14 @@ class SeleniumBet365Provider(OddsProvider):
             )
             return props
 
+        # Bootstrap the app on the main site first so its session/cookies are
+        # established; a deep match URL loaded cold often stalls on a splash
+        # state until the SPA has initialised.
+        self._bootstrap(driver)
+
         for competition, url in targets:
             try:
-                driver.get(url)
+                self._open_match(driver, url)
                 self._open_shots_tab(driver)
                 event_name = self._read_event_name(driver)
                 found = self._parse_match_page(driver, competition, event_name)
@@ -641,6 +690,32 @@ class SeleniumBet365Provider(OddsProvider):
                     url, exc, _safe_title(driver),
                 )
         return props
+
+    def _bootstrap(self, driver) -> None:
+        """Load the main site once so the SPA initialises before deep links."""
+        try:
+            driver.get(f"{self.base_url}/#/AS/B1/")
+            self._wait_for(driver, ".hrm-7, .wc-PageView, .gl-MarketGroupPod, .sln-8")
+            self._dismiss_cookies(driver)
+            time.sleep(2)
+        except Exception as exc:  # pragma: no cover - best effort
+            log.debug("Bet365: bootstrap load failed: %s", exc)
+
+    def _open_match(self, driver, url: str) -> None:
+        """Navigate to a match page, reloading if the markets don't render."""
+        for attempt in range(3):
+            driver.get(url)
+            if self._wait_for(driver, ".sph-MarketGroupNavBarButton, .gl-MarketGroupPod"):
+                return
+            log.info(
+                "Bet365: match page markets not ready (attempt %d/3), reloading",
+                attempt + 1,
+            )
+            time.sleep(2)
+        log.warning(
+            "Bet365: match page never rendered its market bar (%s) — the URL "
+            "may be stale/expired or the game may be closed.", url,
+        )
 
     def _open_shots_tab(self, driver) -> None:
         """Click the match page's 'Shots' market-group tab and let it render."""
