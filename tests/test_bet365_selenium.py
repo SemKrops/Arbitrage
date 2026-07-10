@@ -86,7 +86,10 @@ def test_list_fixtures_from_coupon(driver):
     coupon = Path(__file__).parent / "fixtures" / "bet365_coupon.html"
     driver.get(coupon.as_uri())
     names = [name for _, name in provider._list_fixtures(driver)]
+    # Football fixtures from the coupon main column only; the sidebar tennis
+    # match ("Zverev v Sinner") must be excluded by the scope.
     assert names == ["Argentinie v Engeland", "Frankrijk v Marokko"]
+    assert "Zverev v Sinner" not in names
 
 
 def test_milestone_to_int_and_match_urls():

@@ -266,6 +266,17 @@ function collectRoots(root) {
 }
 collectRoots(document);
 
+// Scope the search to the coupon's MAIN content column, so the left-nav
+// sidebar and homepage 'Upcoming' widget (which mix other sports) are
+// excluded. Fall back to the whole document only if no coupon column exists.
+let scopes = [];
+for (const root of roots) {
+  for (const c of root.querySelectorAll(
+    '[class*="CouponPageReactResponsive_PageViewMain"], [class*="CouponPage"][class*="Main"]'
+  )) scopes.push(c);
+}
+if (!scopes.length) scopes = roots;
+
 const out = [];
 const seen = new Set();
 function push(el, name) {
@@ -275,50 +286,39 @@ function push(el, name) {
     out.push([el, name]);
   }
 }
+function queryAll(sel) {
+  const els = [];
+  for (const scope of scopes) for (const el of scope.querySelectorAll(sel)) els.push(el);
+  return els;
+}
 
 // 1. A single element containing both team names (newline/￼ separated).
-for (const root of roots) {
-  for (const el of root.querySelectorAll(
-    '.rcl-ParticipantFixtureDetails_TeamNames, [class*="FixtureDetails_TeamNames"], ' +
-    '.sl-CouponParticipantWithBookCloses_Name, [class*="_TeamNames"]'
-  )) {
-    push(el, (el.innerText || '').trim().replace(/\s*\n\s*/g, ' v '));
-  }
+for (const el of queryAll(
+  '.rcl-ParticipantFixtureDetails_TeamNames, [class*="FixtureDetails_TeamNames"], ' +
+  '.sl-CouponParticipantWithBookCloses_Name, [class*="_TeamNames"]'
+)) {
+  push(el, (el.innerText || '').trim().replace(/\s*\n\s*/g, ' v '));
 }
 if (out.length) return out;
 
 // 2. Two sibling team-name elements per fixture (home + away).
-for (const root of roots) {
-  const teams = root.querySelectorAll(
-    '[class*="FixtureDetails_Team"]:not([class*="TeamNames"]), ' +
-    '[class*="TwoWay_TeamName"], [class*="Competitor_Name"], [class*="_TeamName"]'
-  );
-  for (let i = 0; i + 1 < teams.length; i += 2) {
-    const a = (teams[i].innerText || '').trim();
-    const b = (teams[i + 1].innerText || '').trim();
-    if (a && b) push(teams[i], a + ' v ' + b);
-  }
+const teams = queryAll(
+  '[class*="FixtureDetails_Team"]:not([class*="TeamNames"]), ' +
+  '[class*="TwoWay_TeamName"], [class*="Competitor_Name"], [class*="_TeamName"]'
+);
+for (let i = 0; i + 1 < teams.length; i += 2) {
+  const a = (teams[i].innerText || '').trim();
+  const b = (teams[i + 1].innerText || '').trim();
+  if (a && b) push(teams[i], a + ' v ' + b);
 }
 if (out.length) return out;
 
-// 3. Leaf "X v Y" texts outside the navigation/header chrome.
-function inChrome(el) {
-  let n = el;
-  for (let i = 0; i < 14 && n; i++) {
-    const c = (n.className && n.className.baseVal !== undefined)
-      ? n.className.baseVal : (n.className || '');
-    if (/(^|\s)(lhs|sln|hrm|wc|wn|hl|nav)-/.test(String(c))) return true;
-    n = n.parentElement || (n.getRootNode && n.getRootNode().host);
-  }
-  return false;
-}
+// 3. Leaf "X v Y" texts within the coupon scope.
 const re = /^[A-Z][\w .'À-ɏ-]{1,28} v [A-Z][\w .'À-ɏ-]{1,28}$/;
-for (const root of roots) {
-  for (const el of root.querySelectorAll('a, div, span')) {
-    if (el.children.length > 3) continue;
-    const t = (el.innerText || '').trim();
-    if (re.test(t) && !inChrome(el)) push(el, t);
-  }
+for (const el of queryAll('a, div, span')) {
+  if (el.children.length > 3) continue;
+  const t = (el.innerText || '').trim();
+  if (re.test(t)) push(el, t);
 }
 return out;
 """
@@ -932,13 +932,13 @@ class SeleniumBet365Provider(OddsProvider):
         coupon = next((u for c, u in self.coupon_urls if c is competition), None)
         if coupon:
             driver.get(coupon)  # plain load, no refresh
-            if not self._is_dead_page(driver):
+            if self._on_competition_coupon(driver, competition):
                 self._settle_coupon(driver)
                 if self._list_fixtures(driver):
                     self._coupon_return_url = coupon
                     return True
             log.info(
-                "Bet365: coupon URL for %s not usable (expired/dead); "
+                "Bet365: coupon URL for %s not usable (expired or wrong page); "
                 "navigating via the sidebar instead.", competition.value,
             )
 
@@ -964,18 +964,29 @@ class SeleniumBet365Provider(OddsProvider):
         return False
 
     def _on_competition_coupon(self, driver, competition: Competition) -> bool:
-        """True once the main coupon area shows this competition's page."""
+        """True once the coupon's own header names this competition.
+
+        Checks a coupon-specific container's leading text (e.g. "WK voetbal
+        2026 …") — NOT a broad page container that also wraps the sidebar,
+        which would falsely match the "WK 2026" nav item on the homepage.
+        """
         if self._is_dead_page(driver):
             return False
         try:
-            text = driver.execute_script(
-                "const m = document.querySelector("
-                "  '[class*=\"CouponPage\"], [class*=\"PageViewMain\"]');"
-                "return m ? (m.innerText || '').slice(0, 300).toLowerCase() : '';"
+            header = driver.execute_script(
+                "for (const s of ['[class*=\"CouponPageReactResponsive\"]',"
+                "                  '[class*=\"wc-CouponPage\"]',"
+                "                  '[class*=\"CouponPage\"][class*=\"Main\"]']) {"
+                "  const el = document.querySelector(s);"
+                "  if (el) return (el.innerText || '').slice(0, 80).toLowerCase();"
+                "}"
+                "return null;"
             )
         except Exception:
             return False
-        return any(k in text for k in COMPETITION_COUPON_KEYWORDS[competition])
+        if not header:
+            return False
+        return any(k in header for k in COMPETITION_COUPON_KEYWORDS[competition])
 
     def _quick_click_text(self, driver, pattern: str) -> bool:
         """One-shot: click the first element matching ``pattern`` (no polling)."""
