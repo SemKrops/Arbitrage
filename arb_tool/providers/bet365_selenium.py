@@ -829,7 +829,7 @@ class SeleniumBet365Provider(OddsProvider):
                     for url in explicit:
                         props.extend(self._scrape_match_url(driver, competition, url))
                 else:
-                    props.extend(self._scrape_competition(driver, competition))
+                    props.extend(self._scrape_competition_resilient(driver, competition))
             except Exception as exc:
                 log.warning(
                     "Bet365: scraping %s failed (%s). Page title was %r — a "
@@ -838,6 +838,21 @@ class SeleniumBet365Provider(OddsProvider):
                     competition.value, exc, _safe_title(driver),
                 )
         return props
+
+    def _scrape_competition_resilient(
+        self, driver, competition: Competition
+    ) -> list[PropOdds]:
+        """Scrape a competition, retrying once if a stale element aborts it."""
+        for attempt in range(2):
+            try:
+                return self._scrape_competition(driver, competition)
+            except StaleElementReferenceException:
+                log.info(
+                    "Bet365: %s hit a stale element (attempt %d/2), retrying",
+                    competition.value, attempt + 1,
+                )
+                self._bootstrap(driver)
+        return []
 
     def _scrape_match_url(self, driver, competition: Competition, url: str) -> list[PropOdds]:
         self._open_match(driver, url)
@@ -990,7 +1005,11 @@ class SeleniumBet365Provider(OddsProvider):
 
     def _quick_click_text(self, driver, pattern: str) -> bool:
         """One-shot: click the first element matching ``pattern`` (no polling)."""
-        for element in driver.execute_script(_TEXT_CANDIDATES_JS, pattern):
+        try:
+            candidates = driver.execute_script(_TEXT_CANDIDATES_JS, pattern)
+        except Exception:
+            return False
+        for element in candidates:
             if self._click(driver, element):
                 return True
         return False
@@ -1000,26 +1019,33 @@ class SeleniumBet365Provider(OddsProvider):
 
         Tries each candidate and climbs to clickable ancestors (bet365 often
         puts the click handler above the text span), polling ``done`` after
-        each click. Returns True as soon as ``done()`` holds.
+        each click. Returns True as soon as ``done()`` holds. Fully tolerant
+        of stale elements — clicking often re-renders the page and invalidates
+        references mid-loop.
         """
         deadline = time.time() + self.page_timeout
         while time.time() < deadline:
-            for element in driver.execute_script(_TEXT_CANDIDATES_JS, pattern):
+            try:
+                candidates = driver.execute_script(_TEXT_CANDIDATES_JS, pattern)
+            except Exception:
+                candidates = []
+            for element in candidates:
                 target = element
                 for _ in range(4):
-                    try:
-                        self._click(driver, target)
-                    except Exception:
-                        break
+                    if not self._click(driver, target):
+                        break  # element went stale
                     time.sleep(1.5)
                     try:
                         if done():
                             return True
                     except Exception:
                         pass
-                    target = driver.execute_script(
-                        "return arguments[0].parentElement", target
-                    )
+                    try:
+                        target = driver.execute_script(
+                            "return arguments[0].parentElement", target
+                        )
+                    except StaleElementReferenceException:
+                        break
                     if target is None:
                         break
             time.sleep(1)
@@ -1036,17 +1062,20 @@ class SeleniumBet365Provider(OddsProvider):
         self._quick_click_text(driver, r"^(wedstrijden|matches|fixtures)$")
         deadline = time.time() + self.page_timeout
         while time.time() < deadline:
-            if self._list_fixtures(driver):
-                return
-            # bet365 virtualises long lists; nudge the window and any inner
-            # scroll containers so more fixtures render.
-            driver.execute_script(
-                "window.scrollBy(0, 700);"
-                "document.querySelectorAll("
-                "  '[class*=\"PageViewMain\"], [class*=\"Scroller\"], "
-                "   [class*=\"CouponPage\"], [class*=\"Wrapper\"]'"
-                ").forEach(e => { e.scrollTop += 700; });"
-            )
+            try:
+                if self._list_fixtures(driver):
+                    return
+                # bet365 virtualises long lists; nudge the window and any inner
+                # scroll containers so more fixtures render.
+                driver.execute_script(
+                    "window.scrollBy(0, 700);"
+                    "document.querySelectorAll("
+                    "  '[class*=\"PageViewMain\"], [class*=\"Scroller\"], "
+                    "   [class*=\"CouponPage\"], [class*=\"Wrapper\"]'"
+                    ").forEach(e => { e.scrollTop += 700; });"
+                )
+            except StaleElementReferenceException:
+                pass
             time.sleep(1)
 
     def _list_fixtures(self, driver) -> list[tuple[object, str]]:
