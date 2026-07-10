@@ -862,7 +862,6 @@ class SeleniumBet365Provider(OddsProvider):
         if coupon:
             self._coupon_return_url = coupon
             driver.get(coupon)  # plain load, no refresh (refresh -> "expired")
-            self._wait_until(lambda: self._list_fixtures(driver))
             if self._is_dead_page(driver):
                 log.warning(
                     "Bet365: %s coupon page is no longer available (%s) — "
@@ -870,6 +869,7 @@ class SeleniumBet365Provider(OddsProvider):
                     competition.value, coupon,
                 )
                 return []
+            self._settle_coupon(driver)
         else:
             self._coupon_return_url = None
             log.warning(
@@ -888,6 +888,10 @@ class SeleniumBet365Provider(OddsProvider):
         )
         if not fixtures:
             try:
+                # Scroll once more, then report what rendered so the row
+                # selector can be pinned to the coupon's real classes.
+                driver.execute_script("window.scrollBy(0, 1200);")
+                time.sleep(2)
                 diag = driver.execute_script(_FIXTURE_DIAG_JS)
                 log.warning(
                     "Bet365: no fixtures parsed on the coupon page. Fixture-ish "
@@ -987,6 +991,30 @@ class SeleniumBet365Provider(OddsProvider):
                         break
             time.sleep(1)
         return False
+
+    def _settle_coupon(self, driver) -> None:
+        """Wait for and scroll the coupon so its fixtures lazily render."""
+        self._wait_for(
+            driver,
+            '.wc-CouponPageReactResponsive_PageViewMain, [class*="CouponPage"], '
+            '.gl-MarketGroupPod, [class*="ParticipantFixtureDetails"]',
+        )
+        # Make sure the "Wedstrijden"/"Matches" (fixtures) view is selected.
+        self._click_text(driver, r"^(wedstrijden|matches|fixtures)$", lambda: True)
+        deadline = time.time() + self.page_timeout
+        while time.time() < deadline:
+            if self._list_fixtures(driver):
+                return
+            # bet365 virtualises long lists; nudge the window and any inner
+            # scroll containers so more fixtures render.
+            driver.execute_script(
+                "window.scrollBy(0, 700);"
+                "document.querySelectorAll("
+                "  '[class*=\"PageViewMain\"], [class*=\"Scroller\"], "
+                "   [class*=\"CouponPage\"], [class*=\"Wrapper\"]'"
+                ").forEach(e => { e.scrollTop += 700; });"
+            )
+            time.sleep(1)
 
     def _list_fixtures(self, driver) -> list[tuple[object, str]]:
         rows = driver.execute_script(_FIXTURE_ROWS_JS)
