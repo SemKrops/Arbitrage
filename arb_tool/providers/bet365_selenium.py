@@ -229,6 +229,20 @@ return {
 # On-screen texts used to locate the sports-content DOM by anchor.
 _DUMP_ANCHORS = ["WK 2026", "Frankrijk v Marokko", "Alle sporten", "Aankomend", "Live"]
 
+# Dispatch a full pointer+mouse click sequence, since bet365 binds handlers
+# to pointerdown/mousedown (not the 'click' a bare .click() fires).
+_FULL_CLICK_JS = r"""
+const el = arguments[0];
+const o = { bubbles: true, cancelable: true, view: window, button: 0 };
+try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+for (const type of ['pointerover', 'pointerenter', 'pointerdown',
+                    'mousedown', 'pointerup', 'mouseup', 'click']) {
+  const Evt = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+  try { el.dispatchEvent(new Evt(type, o)); } catch (e) {}
+}
+return true;
+"""
+
 # Find clickable elements by their visible text (regex), shadow-DOM aware.
 # bet365 obfuscates its navigation classes, but the labels users click on
 # ("WK 2026", team names) are stable — so navigation keys off text.
@@ -786,8 +800,13 @@ class SeleniumBet365Provider(OddsProvider):
         return (driver.execute_script("return arguments[0].innerText", element) or "").strip()
 
     def _click(self, driver, element) -> bool:
+        """Fire a full pointer+mouse event sequence on ``element``.
+
+        bet365's nav/menu handlers bind to pointerdown/mousedown, which a bare
+        element.click() does not trigger — so dispatch the whole sequence.
+        """
         try:
-            driver.execute_script("arguments[0].click()", element)
+            driver.execute_script(_FULL_CLICK_JS, element)
             return True
         except StaleElementReferenceException:
             return False
@@ -1502,12 +1521,21 @@ class SeleniumBet365Provider(OddsProvider):
     # ------------------------------------------------------------------ #
 
     def _dismiss_cookies(self, driver) -> None:
+        """Accept the cookie banner — bet365 won't render content until then.
+
+        The current NL banner has no stable class, so match the button by
+        its visible text ("Alles accepteren"); keep the old class selector as
+        a fallback for other locales/versions.
+        """
+        clicked = self._quick_click_text(
+            driver,
+            r"^(alles accepteren|accepteren|accepteer alles|accept all|"
+            r"accept|ik ga akkoord|akkoord|allow all)$",
+        )
         for button in self._query(driver, SELECTORS["cookie_accept"]):
-            try:
-                self._click(driver, button)
-                time.sleep(0.3)
-            except Exception:  # pragma: no cover - best effort
-                pass
+            clicked = self._click(driver, button) or clicked
+        if clicked:
+            time.sleep(1)
 
     def _wait_for(self, driver, selector: str, timeout: float | None = None) -> bool:
         """Wait until ``selector`` exists, searching iframes and shadow DOM.
