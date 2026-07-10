@@ -723,6 +723,19 @@ class SeleniumBet365Provider(OddsProvider):
     # ------------------------------------------------------------------ #
 
     def fetch_props(self, competitions: tuple[Competition, ...]) -> list[PropOdds]:
+        if self.match_urls:
+            log.info(
+                "Bet365: BET365_MATCH_URLS is set (%d URL(s)) — scraping ONLY "
+                "those and skipping auto-discovery. Unset it to scan every "
+                "listed match. Configured: %s",
+                len(self.match_urls),
+                [f"{c.value}={u}" for c, u in self.match_urls],
+            )
+        else:
+            log.info(
+                "Bet365: auto-discovering matches by competition (no "
+                "BET365_MATCH_URLS set)"
+            )
         driver = self._build_driver()
         try:
             return self._scrape(driver, competitions)
@@ -754,7 +767,27 @@ class SeleniumBet365Provider(OddsProvider):
 
     def _scrape_match_url(self, driver, competition: Competition, url: str) -> list[PropOdds]:
         self._open_match(driver, url)
+        if self._is_dead_page(driver):
+            log.warning(
+                "Bet365: %s is no longer available (game finished/removed). "
+                "Remove it from BET365_MATCH_URLS, or unset BET365_MATCH_URLS "
+                "entirely to auto-scan the current fixtures.", url,
+            )
+            return []
         return self._scrape_current_match(driver, competition, fallback_name="")
+
+    def _is_dead_page(self, driver) -> bool:
+        """True when bet365 shows its 'page no longer available' notice."""
+        try:
+            body = driver.execute_script(
+                "return document.body ? document.body.innerText : ''"
+            ).lower()
+        except Exception:
+            return False
+        return (
+            "niet langer beschikbaar" in body  # NL
+            or "no longer available" in body  # EN
+        )
 
     def _scrape_competition(self, driver, competition: Competition) -> list[PropOdds]:
         """Open the competition from the nav and scrape every listed match."""
