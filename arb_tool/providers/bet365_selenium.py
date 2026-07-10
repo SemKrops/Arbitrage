@@ -90,11 +90,12 @@ MILESTONE_MARKET_TITLES = {
     "spelersschoten op doel": Market.SHOTS_ON_TARGET,
 }
 
-# Link texts used to find each competition from the football section.
-COMPETITION_LINKS = {
-    Competition.PREMIER_LEAGUE: ("premier league",),
-    Competition.LA_LIGA: ("laliga", "la liga"),
-    Competition.WORLD_CUP: ("world cup", "wk", "wereldkampioenschap"),
+# Regexes (applied to visible link text, case-insensitive) used to find each
+# competition in bet365's navigation. Text survives the class obfuscation.
+COMPETITION_LINK_PATTERNS = {
+    Competition.PREMIER_LEAGUE: r"^premier league$",
+    Competition.LA_LIGA: r"^la ?liga$",
+    Competition.WORLD_CUP: r"^(wk( \d{4})?|(fifa )?world cup( \d{4})?|wereldkampioenschap( \d{4})?)$",
 }
 
 # Injected before any page script runs: bet365 creates its shadow roots
@@ -212,6 +213,82 @@ return {
 
 # On-screen texts used to locate the sports-content DOM by anchor.
 _DUMP_ANCHORS = ["WK 2026", "Frankrijk v Marokko", "Alle sporten", "Aankomend", "Live"]
+
+# Find clickable elements by their visible text (regex), shadow-DOM aware.
+# bet365 obfuscates its navigation classes, but the labels users click on
+# ("WK 2026", team names) are stable — so navigation keys off text.
+_TEXT_CANDIDATES_JS = r"""
+const pattern = new RegExp(arguments[0], 'i');
+const roots = [];
+function collectRoots(root) {
+  if (!root.querySelectorAll) return;
+  roots.push(root);
+  for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collectRoots(el.shadowRoot);
+}
+collectRoots(document);
+const out = [];
+for (const root of roots) {
+  for (const el of root.querySelectorAll('a, div, span, button')) {
+    if (el.children.length > 3) continue;
+    const t = (el.innerText || '').trim();
+    if (!t || t.length > 60) continue;
+    if (pattern.test(t)) out.push(el);
+  }
+}
+return out;
+"""
+
+# List the fixtures on a competition coupon page as [element, "A v B"] pairs.
+# Prefers bet365's coupon classes; falls back to leaf "X v Y" texts outside
+# the (obfuscated) navigation chrome.
+_FIXTURE_ROWS_JS = r"""
+const roots = [];
+function collectRoots(root) {
+  if (!root.querySelectorAll) return;
+  roots.push(root);
+  for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collectRoots(el.shadowRoot);
+}
+collectRoots(document);
+
+const out = [];
+const seen = new Set();
+for (const root of roots) {
+  for (const el of root.querySelectorAll(
+    '.rcl-ParticipantFixtureDetails_TeamNames, [class*="FixtureDetails_TeamNames"], ' +
+    '.sl-CouponParticipantWithBookCloses_Name'
+  )) {
+    const name = (el.innerText || '').trim().replace(/\s*\n\s*/g, ' v ');
+    if (name && name.includes(' v ') && !seen.has(name)) {
+      seen.add(name);
+      out.push([el, name]);
+    }
+  }
+}
+if (out.length) return out;
+
+function inChrome(el) {
+  let n = el;
+  for (let i = 0; i < 14 && n; i++) {
+    const c = (n.className && n.className.baseVal !== undefined)
+      ? n.className.baseVal : (n.className || '');
+    if (/(^|\s)(lhs|sln|hrm|wc|wn|hl|nav)-/.test(String(c))) return true;
+    n = n.parentElement || (n.getRootNode && n.getRootNode().host);
+  }
+  return false;
+}
+const re = /^[A-Z][\w .'À-ɏ-]{1,28} v [A-Z][\w .'À-ɏ-]{1,28}$/;
+for (const root of roots) {
+  for (const el of root.querySelectorAll('a, div, span')) {
+    if (el.children.length > 3) continue;
+    const t = (el.innerText || '').trim();
+    if (re.test(t) && !inChrome(el) && !seen.has(t)) {
+      seen.add(t);
+      out.push([el, t]);
+    }
+  }
+}
+return out;
+"""
 
 # Extract the shots milestone grids into structured rows. Each shots pod is
 # a set of columns: one player column (.srb-ParticipantLabelWithTeam_Name)
@@ -654,42 +731,141 @@ class SeleniumBet365Provider(OddsProvider):
 
     def _scrape(self, driver, competitions: tuple[Competition, ...]) -> list[PropOdds]:
         props: list[PropOdds] = []
-        targets = [
-            (comp, url) for comp, url in self.match_urls if comp in competitions
-        ]
-        if not targets:
-            log.warning(
-                "Bet365: no match URLs configured for the requested "
-                "competitions. Set BET365_MATCH_URLS (e.g. "
-                "world_cup=https://www.bet365.nl/#/AC/...) to the match pages "
-                "you want scraped. See --dump-bet365 to grab a match URL."
-            )
-            return props
-
         # Bootstrap the app on the main site first so its session/cookies are
-        # established; a deep match URL loaded cold often stalls on a splash
-        # state until the SPA has initialised.
+        # established; deep/hash navigation stalls until the SPA initialised.
         self._bootstrap(driver)
 
-        for competition, url in targets:
+        for competition in competitions:
+            explicit = [url for comp, url in self.match_urls if comp is competition]
             try:
-                self._open_match(driver, url)
-                self._open_shots_tab(driver)
-                event_name = self._read_event_name(driver)
-                found = self._parse_match_page(driver, competition, event_name)
-                log.info(
-                    "Bet365: %s (%s) — %d shots props",
-                    event_name, competition.value, len(found),
-                )
-                props.extend(found)
+                if explicit:
+                    for url in explicit:
+                        props.extend(self._scrape_match_url(driver, competition, url))
+                else:
+                    props.extend(self._scrape_competition(driver, competition))
             except Exception as exc:
                 log.warning(
                     "Bet365: scraping %s failed (%s). Page title was %r — a "
                     "block/challenge page usually means your IP or headless "
                     "browser was detected; run --dump-bet365 to inspect.",
-                    url, exc, _safe_title(driver),
+                    competition.value, exc, _safe_title(driver),
                 )
         return props
+
+    def _scrape_match_url(self, driver, competition: Competition, url: str) -> list[PropOdds]:
+        self._open_match(driver, url)
+        return self._scrape_current_match(driver, competition, fallback_name="")
+
+    def _scrape_competition(self, driver, competition: Competition) -> list[PropOdds]:
+        """Open the competition from the nav and scrape every listed match."""
+        if not self._open_competition_page(driver, competition):
+            return []
+        fixtures = [name for _, name in self._list_fixtures(driver)]
+        log.info(
+            "Bet365: %s — %d fixtures listed: %s",
+            competition.value, len(fixtures), fixtures[: self.max_events],
+        )
+        list_url = driver.current_url
+        props: list[PropOdds] = []
+        for name in fixtures[: self.max_events]:
+            try:
+                if not self._open_fixture(driver, name):
+                    log.warning("Bet365: could not open fixture %r", name)
+                    continue
+                props.extend(
+                    self._scrape_current_match(driver, competition, fallback_name=name)
+                )
+            finally:
+                self._return_to_list(driver, list_url)
+        return props
+
+    def _scrape_current_match(
+        self, driver, competition: Competition, fallback_name: str
+    ) -> list[PropOdds]:
+        self._open_shots_tab(driver)
+        event_name = self._read_event_name(driver) or fallback_name
+        if fallback_name and not _same_fixture(event_name, fallback_name):
+            # The header probe can misfire; the name we clicked is authoritative.
+            event_name = fallback_name.replace(" v ", " vs ")
+        found = self._parse_match_page(driver, competition, event_name)
+        log.info(
+            "Bet365: %s (%s) — %d shots props",
+            event_name, competition.value, len(found),
+        )
+        return found
+
+    # ---------------- competition/fixture navigation ------------------- #
+
+    def _open_competition_page(self, driver, competition: Competition) -> bool:
+        """Click the competition's nav link (found by text) from the base page."""
+        driver.get(f"{self.base_url}/#/AS/B1/")
+        driver.refresh()  # hash-only navigation doesn't re-route the SPA
+        self._wait_for(driver, "body")
+        self._dismiss_cookies(driver)
+        pattern = COMPETITION_LINK_PATTERNS[competition]
+        deadline = time.time() + self.page_timeout
+        links = []
+        while time.time() < deadline and not links:
+            links = driver.execute_script(_TEXT_CANDIDATES_JS, pattern)
+            if not links:
+                time.sleep(1)
+        if not links:
+            log.warning(
+                "Bet365: no %s link found in navigation (pattern %s) — check "
+                "the competition is listed on the site.",
+                competition.value, pattern,
+            )
+            return False
+        self._click(driver, links[0])
+        if self._wait_until(lambda: self._list_fixtures(driver)):
+            return True
+        log.warning(
+            "Bet365: clicked %s but no fixture list appeared", competition.value
+        )
+        return False
+
+    def _list_fixtures(self, driver) -> list[tuple[object, str]]:
+        rows = driver.execute_script(_FIXTURE_ROWS_JS)
+        return [(el, name) for el, name in rows]
+
+    def _open_fixture(self, driver, name: str) -> bool:
+        """Click the fixture row with this name and wait for the match page."""
+        for element, row_name in self._list_fixtures(driver):
+            if row_name != name:
+                continue
+            # Click the row (or a clickable ancestor if the label ignores it).
+            target = element
+            for _ in range(4):
+                self._click(driver, target)
+                if self._wait_for(
+                    driver, ".sph-MarketGroupNavBarButton, .gl-MarketGroupPod",
+                    timeout=6,
+                ):
+                    return True
+                parent = driver.execute_script(
+                    "return arguments[0].parentElement", target
+                )
+                if parent is None:
+                    break
+                target = parent
+            return False
+        return False
+
+    def _return_to_list(self, driver, list_url: str) -> None:
+        driver.get(list_url)
+        driver.refresh()  # force the SPA to re-route to the coupon
+        self._wait_until(lambda: self._list_fixtures(driver))
+
+    def _wait_until(self, condition) -> bool:
+        deadline = time.time() + self.page_timeout
+        while time.time() < deadline:
+            try:
+                if condition():
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+        return False
 
     def _bootstrap(self, driver) -> None:
         """Load the main site once so the SPA initialises before deep links."""
@@ -702,9 +878,15 @@ class SeleniumBet365Provider(OddsProvider):
             log.debug("Bet365: bootstrap load failed: %s", exc)
 
     def _open_match(self, driver, url: str) -> None:
-        """Navigate to a match page, reloading if the markets don't render."""
+        """Navigate to a match page, reloading if the markets don't render.
+
+        bet365 is a hash-routed SPA: driver.get() onto a different #/...
+        fragment doesn't re-route the app, so force a refresh to boot the
+        SPA directly at the match route.
+        """
+        driver.get(url)
         for attempt in range(3):
-            driver.get(url)
+            driver.refresh()
             if self._wait_for(driver, ".sph-MarketGroupNavBarButton, .gl-MarketGroupPod"):
                 return
             log.info(
@@ -981,7 +1163,7 @@ class SeleniumBet365Provider(OddsProvider):
             except Exception:  # pragma: no cover - best effort
                 pass
 
-    def _wait_for(self, driver, selector: str) -> bool:
+    def _wait_for(self, driver, selector: str, timeout: float | None = None) -> bool:
         """Wait until ``selector`` exists, searching iframes and shadow DOM.
 
         On success the driver context is left switched to whichever
@@ -990,7 +1172,7 @@ class SeleniumBet365Provider(OddsProvider):
         from selenium.webdriver.support.ui import WebDriverWait
 
         try:
-            WebDriverWait(driver, self.page_timeout).until(
+            WebDriverWait(driver, timeout or self.page_timeout).until(
                 lambda d: self._enter_context_with(d, selector)
             )
             return True
@@ -1036,6 +1218,18 @@ def _milestone_to_int(header: str) -> int | None:
     """"3+" -> 3."""
     match = re.match(r"(\d+)\+", header.strip())
     return int(match.group(1)) if match else None
+
+
+def _same_fixture(name_a: str, name_b: str) -> bool:
+    """Loose comparison of two 'A v B' fixture names."""
+    def teams(name: str) -> set:
+        return {
+            part.strip().lower()
+            for part in re.split(r"\s+(?:v|vs)\s+", name)
+            if part.strip()
+        }
+
+    return bool(teams(name_a) & teams(name_b))
 
 
 def _parse_match_urls(raw: str) -> list[tuple[Competition, str]]:

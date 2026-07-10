@@ -59,6 +59,36 @@ def test_deep_query_pierces_closed_shadow_dom(driver):
     assert provider._text(driver, found[0]) == "hidden market"
 
 
+def test_same_fixture_and_competition_patterns():
+    import re as _re
+
+    from arb_tool.providers.bet365_selenium import (
+        COMPETITION_LINK_PATTERNS,
+        _same_fixture,
+    )
+
+    assert _same_fixture("Argentinie v Engeland", "Argentinie vs Engeland")
+    assert _same_fixture("Frankrijk v Marokko", "France vs Marokko")  # one team overlaps
+    assert not _same_fixture("Frankrijk v Marokko", "Argentinie v Engeland")
+
+    wc = COMPETITION_LINK_PATTERNS[Competition.WORLD_CUP]
+    assert _re.match(wc, "WK 2026", _re.IGNORECASE)
+    assert _re.match(wc, "World Cup", _re.IGNORECASE)
+    assert not _re.match(wc, "World Cup Qualifying - Europe", _re.IGNORECASE)
+    pl = COMPETITION_LINK_PATTERNS[Competition.PREMIER_LEAGUE]
+    assert _re.match(pl, "Premier League", _re.IGNORECASE)
+    la = COMPETITION_LINK_PATTERNS[Competition.LA_LIGA]
+    assert _re.match(la, "LaLiga", _re.IGNORECASE)
+
+
+def test_list_fixtures_from_coupon(driver):
+    provider = SeleniumBet365Provider()
+    coupon = Path(__file__).parent / "fixtures" / "bet365_coupon.html"
+    driver.get(coupon.as_uri())
+    names = [name for _, name in provider._list_fixtures(driver)]
+    assert names == ["Argentinie v Engeland", "Frankrijk v Marokko"]
+
+
 def test_milestone_to_int_and_match_urls():
     from arb_tool.providers.bet365_selenium import _milestone_to_int, _parse_match_urls
 
