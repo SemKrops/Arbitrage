@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 
 from .arbitrage import find_arbitrages
@@ -61,6 +62,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--once", action="store_true", help="run a single scan and exit")
     parser.add_argument(
+        "--manual-nav",
+        action="store_true",
+        help="for Bet365: pause so you navigate the browser to the competition's "
+        "match list yourself (Bet365 blocks automated navigation), then the tool "
+        "scrapes every match on it (use with BET365_HEADLESS=0)",
+    )
+    parser.add_argument(
         "--find-competition",
         metavar="QUERY",
         help="search Unibet/Kambi's football competition tree by name "
@@ -98,6 +106,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     config = Config.from_env()
+
+    if args.manual_nav:
+        # Consumed by the Bet365 selenium provider at construction time.
+        os.environ["BET365_MANUAL_NAV"] = "1"
 
     if args.bet365_setup:
         from .providers.bet365_selenium import SeleniumBet365Provider

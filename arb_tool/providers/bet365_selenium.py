@@ -663,6 +663,10 @@ class SeleniumBet365Provider(OddsProvider):
         # Defaults to .bet365_profile in the working dir; set empty to disable.
         default_profile = os.path.abspath(".bet365_profile")
         self.user_data_dir = os.environ.get("BET365_USER_DATA_DIR", default_profile).strip()
+        # Manual navigation: bet365 blocks automated navigation (dead pages),
+        # so let the user click to the competition's match list themselves,
+        # then the tool scrapes every match on it. Enabled via --manual-nav.
+        self.manual_nav = os.environ.get("BET365_MANUAL_NAV", "") == "1"
 
     # ------------------------------------------------------------------ #
     # Browser setup
@@ -959,7 +963,10 @@ class SeleniumBet365Provider(OddsProvider):
     def _scrape_competition(self, driver, competition: Competition) -> list[PropOdds]:
         """Open the competition's coupon and scrape every listed match."""
         self._current_competition = competition
-        if not self._open_competition_page(driver, competition):
+        if self.manual_nav:
+            if not self._manual_open_competition(driver, competition):
+                return []
+        elif not self._open_competition_page(driver, competition):
             return []
 
         fixtures = [name for _, name in self._list_fixtures(driver)]
@@ -1065,6 +1072,24 @@ class SeleniumBet365Provider(OddsProvider):
             competition.value, self._is_dead_page(driver), shot, head,
         )
         return False
+
+    def _manual_open_competition(self, driver, competition: Competition) -> bool:
+        """Pause for the user to navigate to the competition's match list."""
+        self._coupon_return_url = None
+        print(
+            f"\n>>> In the bet365 window, click through to the "
+            f"{competition.display_name} MATCH LIST (so you can see the "
+            f"fixtures), then press Enter here to scrape them..."
+        )
+        try:
+            input()
+        except EOFError:
+            time.sleep(20)
+        self._dismiss_cookies(driver)
+        # Leave _coupon_return_url None so we return via in-app back() between
+        # matches (reloading a bet365 hash URL can dead-page).
+        self._settle_coupon(driver)
+        return True
 
     def _on_competition_coupon(self, driver, competition: Competition) -> bool:
         """True once we've reached this competition's content.
