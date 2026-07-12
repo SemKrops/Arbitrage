@@ -737,6 +737,38 @@ class SeleniumBet365Provider(OddsProvider):
         self._install_page_scripts(driver)
         return driver
 
+    def setup_profile(self) -> None:
+        """Open bet365 and wait for the user to accept cookies / sign in.
+
+        Consent (and any login) is saved into the persistent profile, so
+        subsequent automated runs start past the cookie wall — the thing
+        that otherwise blocks all navigation. Run with BET365_HEADLESS=0:
+            python -m arb_tool --bet365-setup
+        """
+        if not self.user_data_dir:
+            print(
+                "BET365_USER_DATA_DIR is disabled; set it (or leave the default "
+                ".bet365_profile) so consent can be remembered."
+            )
+            return
+        driver = self._build_driver()
+        try:
+            driver.get(self.base_url + "/")
+            print(
+                f"\nProfile: {self.user_data_dir}\n"
+                ">>> In the bet365 window, click 'Alles accepteren' (and log in "
+                "if you want), wait until the sport content is visible, then\n"
+                "    press Enter here to save it to the profile..."
+            )
+            try:
+                input()
+            except EOFError:
+                time.sleep(30)
+            self._dismiss_cookies(driver)  # belt-and-suspenders
+            print("Saved. Future runs will reuse this profile.")
+        finally:
+            driver.quit()
+
     def _install_page_scripts(self, driver) -> None:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument", {"source": _FORCE_OPEN_SHADOW_JS}

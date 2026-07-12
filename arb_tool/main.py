@@ -76,6 +76,13 @@ def main(argv: list[str] | None = None) -> int:
         "link texts; saves bet365_dump.html/.png for diagnosing DOM changes",
     )
     parser.add_argument(
+        "--bet365-setup",
+        action="store_true",
+        help="open bet365 in the persistent profile and wait for you to accept "
+        "cookies / log in once, so automated runs start past the cookie wall "
+        "(use with BET365_HEADLESS=0)",
+    )
+    parser.add_argument(
         "--wait",
         action="store_true",
         help="with --dump-bet365: pause after loading so you can navigate the "
@@ -91,6 +98,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     config = Config.from_env()
+
+    if args.bet365_setup:
+        from .providers.bet365_selenium import SeleniumBet365Provider
+
+        SeleniumBet365Provider().setup_profile()
+        return 0
 
     if args.dump_bet365 is not None:
         from .providers.bet365_selenium import SeleniumBet365Provider
