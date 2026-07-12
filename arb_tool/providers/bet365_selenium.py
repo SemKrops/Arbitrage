@@ -658,6 +658,11 @@ class SeleniumBet365Provider(OddsProvider):
         self.coupon_urls = _parse_match_urls(os.environ.get("BET365_COMPETITION_URLS", ""))
         self._current_competition: Competition | None = None
         self._coupon_return_url: str | None = None
+        # Persistent Chrome profile so cookie consent (and any login) is
+        # remembered across runs — accept the banner once and it stays gone.
+        # Defaults to .bet365_profile in the working dir; set empty to disable.
+        default_profile = os.path.abspath(".bet365_profile")
+        self.user_data_dir = os.environ.get("BET365_USER_DATA_DIR", default_profile).strip()
 
     # ------------------------------------------------------------------ #
     # Browser setup
@@ -684,7 +689,8 @@ class SeleniumBet365Provider(OddsProvider):
                 options = uc.ChromeOptions()
                 self._apply_common_options(options)
                 driver = uc.Chrome(
-                    options=options, headless=self.headless, version_main=version
+                    options=options, headless=self.headless, version_main=version,
+                    user_data_dir=self.user_data_dir or None,
                 )
                 self._install_page_scripts(driver)
                 return driver
@@ -709,6 +715,8 @@ class SeleniumBet365Provider(OddsProvider):
 
         options = webdriver.ChromeOptions()
         self._apply_common_options(options)
+        if self.user_data_dir:
+            options.add_argument(f"--user-data-dir={self.user_data_dir}")
         if self.headless:
             options.add_argument("--headless=new")
         # Hide the most obvious webdriver fingerprints.
@@ -1554,14 +1562,38 @@ class SeleniumBet365Provider(OddsProvider):
         while time.time() < deadline:
             if not self._cookie_banner_present(driver):
                 return
-            clicked = self._quick_click_text(driver, accept_re)
-            for button in self._query(driver, SELECTORS["cookie_accept"]):
-                clicked = self._click(driver, button) or clicked
+            self._click_all_accept(driver, accept_re)
             time.sleep(1)
             if not self._cookie_banner_present(driver):
                 return
             time.sleep(0.5)
-        log.info("Bet365: cookie banner still present after retries")
+        log.warning(
+            "Bet365: could not dismiss the cookie banner automatically. Run "
+            "once with BET365_HEADLESS=0 and click 'Alles accepteren' yourself "
+            "— the persistent profile (%s) will remember it for next time.",
+            self.user_data_dir or "<disabled>",
+        )
+
+    def _click_all_accept(self, driver, accept_re: str) -> None:
+        """Click every accept-cookies control in the top doc and each iframe."""
+        from selenium.webdriver.common.by import By
+
+        try:
+            for el in driver.execute_script(_TEXT_CANDIDATES_JS, accept_re):
+                self._click(driver, el)
+            for button in self._query(driver, SELECTORS["cookie_accept"]):
+                self._click(driver, button)
+        except Exception:
+            pass
+        for frame in driver.find_elements(By.TAG_NAME, "iframe"):
+            try:
+                driver.switch_to.frame(frame)
+                for el in driver.execute_script(_TEXT_CANDIDATES_JS, accept_re):
+                    self._click(driver, el)
+            except Exception:
+                pass
+            finally:
+                driver.switch_to.default_content()
 
     def _cookie_banner_present(self, driver) -> bool:
         try:
